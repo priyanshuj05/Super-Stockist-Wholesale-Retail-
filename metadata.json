@@ -1,0 +1,6 @@
+{
+  "name": "Distribution & Retail Hub",
+  "description": "Fast, lightweight 3-sided web application for Super Stockists, Salesmen, and Local Retail Stores with high-contrast minimalist interface.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
