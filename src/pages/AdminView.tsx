@@ -31,7 +31,9 @@ import {
   CreditCard,
   QrCode,
   Tag,
-  Gift
+  Gift,
+  Download,
+  FileSpreadsheet
 } from 'lucide-react';
 
 export function AdminView() {
@@ -77,6 +79,30 @@ export function AdminView() {
 
   // Search & Filter for products
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Definable Low Stock Threshold (defaults to 10 units, persisted in localStorage)
+  const [lowStockThreshold, setLowStockThreshold] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('FMCG_LOW_STOCK_THRESHOLD');
+      if (saved) {
+        const val = parseInt(saved, 10);
+        if (!isNaN(val) && val >= 0) return val;
+      }
+    } catch {
+      // fallback
+    }
+    return 10;
+  });
+
+  const [filterLowStockOnly, setFilterLowStockOnly] = useState<boolean>(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('FMCG_LOW_STOCK_THRESHOLD', lowStockThreshold.toString());
+    } catch {
+      // ignore
+    }
+  }, [lowStockThreshold]);
 
   // Add Product Modal State
   const [showAddModal, setShowAddModal] = useState(false);
@@ -313,12 +339,94 @@ export function AdminView() {
     updateStock(productId, currentStock + delta);
   };
 
-  // Filtered Products
-  const filteredProducts = products.filter(
-    (p) =>
+  // Handler: Export current orders list to CSV for manual accounting backup
+  const handleExportOrdersCSV = () => {
+    const targetOrders = orderFilter === 'ALL'
+      ? orders
+      : orders.filter((o) => (o.orderType || 'wholesale') === orderFilter);
+
+    if (targetOrders.length === 0) {
+      alert('No orders available in the selected filter to export.');
+      return;
+    }
+
+    const headers = [
+      'Invoice Number',
+      'Order ID',
+      'Date & Time',
+      'Order Type',
+      'Customer / Store Name',
+      'Contact Mobile',
+      'Retailer GSTIN',
+      'Delivery Address',
+      'Sales Representative',
+      'Items Detail',
+      'Total Line Items',
+      'Total Units',
+      'Total Amount (INR)',
+      'Order Status',
+      'Payment Status'
+    ];
+
+    const escapeCsv = (val: string | number | undefined | null) => {
+      if (val === undefined || val === null) return '""';
+      const str = String(val).replace(/"/g, '""');
+      return `"${str}"`;
+    };
+
+    const rows = targetOrders.map((ord) => {
+      const itemsDetail = ord.items
+        .map((i) => `${i.productName} (Qty: ${i.quantity} @ Rs.${i.unitPrice}${i.hsn ? ` [HSN:${i.hsn}]` : ''}${i.wholesaleScheme ? ` [Scheme:${i.wholesaleScheme}]` : ''}${i.retailOffer ? ` [Offer:${i.retailOffer}]` : ''})`)
+        .join('; ');
+      const totalUnits = ord.items.reduce((sum, i) => sum + i.quantity, 0);
+
+      return [
+        escapeCsv(ord.invoiceNumber || ord.id),
+        escapeCsv(ord.id),
+        escapeCsv(ord.createdAt),
+        escapeCsv(ord.orderType || 'wholesale'),
+        escapeCsv(ord.storeName || ord.customerName || 'N/A'),
+        escapeCsv(ord.customerMobile || 'N/A'),
+        escapeCsv(ord.retailerGstin || 'N/A'),
+        escapeCsv(ord.deliveryAddress || 'N/A'),
+        escapeCsv(ord.salesmanName || (ord.orderType === 'wholesale' ? 'Field Sales Rep' : 'Direct Consumer Store')),
+        escapeCsv(itemsDetail),
+        escapeCsv(ord.items.length),
+        escapeCsv(totalUnits),
+        escapeCsv(ord.totalAmount),
+        escapeCsv(ord.status),
+        escapeCsv(ord.paymentStatus)
+      ].join(',');
+    });
+
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows].join('\r\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const timestamp = new Date().toISOString().slice(0, 10);
+    const filterSuffix = orderFilter !== 'ALL' ? `_${orderFilter}` : '';
+    link.setAttribute('href', url);
+    link.setAttribute('download', `FMCG_Live_Bills_Backup_${timestamp}${filterSuffix}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  // Low Stock Calculation
+  const lowStockProducts = products.filter((p) => p.stock <= lowStockThreshold);
+  const lowStockCount = lowStockProducts.length;
+
+  // Filtered Products (Search + Low Stock Filter)
+  const filteredProducts = products.filter((p) => {
+    const matchesSearch =
       p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      p.sku.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+      p.sku.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (p.hsn && p.hsn.toLowerCase().includes(searchQuery.toLowerCase()));
+    if (!matchesSearch) return false;
+    if (filterLowStockOnly) return p.stock <= lowStockThreshold;
+    return true;
+  });
 
   // Filtered Issues
   const filteredIssues = issues.filter((iss) => {
@@ -342,8 +450,8 @@ export function AdminView() {
           </p>
         </div>
 
-        {/* Global Stock KPI indicators */}
-        <div className="grid grid-cols-3 gap-2 text-xs font-mono">
+        {/* Global Stock KPI indicators with Low Stock Alert Card */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
           <div className="border border-black p-2 bg-neutral-50">
             <span className="text-neutral-500 block text-[10px] uppercase">Active SKUs</span>
             <span className="text-base sm:text-lg font-black text-black">{products.length}</span>
@@ -351,6 +459,32 @@ export function AdminView() {
           <div className="border border-black p-2 bg-neutral-50">
             <span className="text-neutral-500 block text-[10px] uppercase">Physical Units</span>
             <span className="text-base sm:text-lg font-black text-black">{totalInventoryUnits}</span>
+          </div>
+          <div 
+            id="kpi-low-stock-card"
+            onClick={() => {
+              setActiveTab('products');
+              setFilterLowStockOnly(true);
+            }}
+            className={`border-2 p-2 cursor-pointer transition-none ${
+              lowStockCount > 0 
+                ? 'bg-red-50 border-red-600 hover:bg-red-100' 
+                : 'bg-neutral-50 border-black hover:bg-neutral-100'
+            }`}
+            title="Click to view all low stock products"
+          >
+            <div className="flex items-center justify-between">
+              <span className={`block text-[10px] uppercase font-bold ${lowStockCount > 0 ? 'text-red-700' : 'text-neutral-500'}`}>
+                Low Stock Alert
+              </span>
+              {lowStockCount > 0 && (
+                <span className="w-2 h-2 rounded-full bg-red-600 animate-pulse"></span>
+              )}
+            </div>
+            <span className={`text-base sm:text-lg font-black ${lowStockCount > 0 ? 'text-red-700' : 'text-black'}`}>
+              {lowStockCount} {lowStockCount === 1 ? 'SKU' : 'SKUs'}
+            </span>
+            <span className="text-[10px] text-neutral-500 block">≤ {lowStockThreshold} units</span>
           </div>
           <div className="border border-black p-2 bg-neutral-50">
             <span className="text-neutral-500 block text-[10px] uppercase">Stock Value (W/S)</span>
@@ -377,6 +511,16 @@ export function AdminView() {
           <span className={`px-1.5 py-0.2 text-[10px] ${activeTab === 'products' ? 'bg-neutral-800 text-white' : 'bg-neutral-200 text-black'}`}>
             {products.length}
           </span>
+          {lowStockCount > 0 && (
+            <span 
+              id="badge-tab-low-stock-alert"
+              className="px-1.5 py-0.2 text-[10px] bg-red-600 text-white font-black flex items-center gap-1 border border-red-800 animate-pulse"
+              title={`${lowStockCount} items at or below ${lowStockThreshold} units`}
+            >
+              <AlertTriangle className="w-3 h-3 text-white" />
+              <span>{lowStockCount} LOW STOCK</span>
+            </span>
+          )}
         </button>
 
         <button
@@ -467,24 +611,81 @@ export function AdminView() {
       {/* ========================================================================= */}
       {activeTab === 'products' && (
         <div id="admin-panel-products" className="space-y-4">
-          {/* Controls Bar: Search & Add Product */}
-          <div className="bg-white border-2 border-black p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-center gap-2 flex-1 max-w-md">
+          {/* Controls Bar: Search, Low Stock Threshold & Add Product */}
+          <div className="bg-white border-2 border-black p-3 flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div className="flex items-center gap-2 flex-1 max-w-sm">
               <Search className="w-4 h-4 text-neutral-500" />
               <input
                 id="input-product-search"
                 type="text"
-                placeholder="Search by SKU or Product Name..."
+                placeholder="Search by SKU, Name or HSN..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="w-full border border-black px-2.5 py-1.5 text-xs font-mono bg-neutral-50 focus:bg-white"
               />
             </div>
 
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-mono text-neutral-600 hidden md:inline">
-                Showing {filteredProducts.length} of {products.length} products
-              </span>
+            {/* Definable Low Stock Threshold & Filter Controls */}
+            <div className="flex flex-wrap items-center gap-2">
+              <div 
+                id="control-low-stock-threshold"
+                className="flex items-center gap-1.5 bg-neutral-100 border border-black px-2.5 py-1 text-xs font-mono"
+                title="Define the stock level below which SKUs trigger a Low Stock warning"
+              >
+                <span className="text-neutral-700 font-bold uppercase text-[11px] whitespace-nowrap">
+                  Alert Threshold:
+                </span>
+                <button
+                  type="button"
+                  id="btn-threshold-minus"
+                  onClick={() => setLowStockThreshold((prev) => Math.max(1, prev - 1))}
+                  className="w-5 h-5 bg-white border border-neutral-400 hover:bg-neutral-200 text-black font-bold flex items-center justify-center text-xs cursor-pointer"
+                  title="Decrease threshold by 1"
+                >
+                  -
+                </button>
+                <input
+                  id="input-low-stock-threshold"
+                  type="number"
+                  min="1"
+                  max="9999"
+                  value={lowStockThreshold}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value, 10);
+                    if (!isNaN(val) && val >= 0) setLowStockThreshold(val);
+                  }}
+                  className="w-14 border border-black px-1.5 py-0.5 text-center text-xs font-mono font-black bg-white"
+                />
+                <span className="text-[10px] text-neutral-600 font-bold">units</span>
+                <button
+                  type="button"
+                  id="btn-threshold-plus"
+                  onClick={() => setLowStockThreshold((prev) => prev + 1)}
+                  className="w-5 h-5 bg-white border border-neutral-400 hover:bg-neutral-200 text-black font-bold flex items-center justify-center text-xs cursor-pointer"
+                  title="Increase threshold by 1"
+                >
+                  +
+                </button>
+              </div>
+
+              {/* Toggle Low Stock Filter */}
+              <button
+                type="button"
+                id="btn-toggle-low-stock-filter"
+                onClick={() => setFilterLowStockOnly(!filterLowStockOnly)}
+                className={`px-2.5 py-1.5 text-xs font-mono font-bold uppercase border-2 flex items-center gap-1.5 cursor-pointer transition-none ${
+                  filterLowStockOnly
+                    ? 'bg-red-700 text-white border-black'
+                    : lowStockCount > 0
+                    ? 'bg-amber-100 text-red-900 border-red-600 hover:bg-amber-200'
+                    : 'bg-white text-neutral-700 border-neutral-400 hover:border-black'
+                }`}
+                title="Filter table to only show low stock items"
+              >
+                <AlertTriangle className={`w-3.5 h-3.5 ${filterLowStockOnly ? 'text-white' : 'text-red-600'}`} />
+                <span>Low Stock Only ({lowStockCount})</span>
+              </button>
+
               <button
                 id="btn-open-add-product"
                 onClick={() => setShowAddModal(true)}
@@ -496,6 +697,41 @@ export function AdminView() {
             </div>
           </div>
 
+          {/* Low Stock Alert Notification Banner */}
+          {lowStockCount > 0 && (
+            <div
+              id="alert-low-stock-banner"
+              className="bg-amber-50 border-2 border-red-600 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs font-mono"
+            >
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 bg-red-600 text-white flex items-center justify-center font-bold flex-shrink-0">
+                  <AlertTriangle className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="font-black text-red-900 uppercase text-xs sm:text-sm flex items-center gap-2">
+                    <span>Low Stock Warning Triggered</span>
+                    <span className="bg-red-600 text-white text-[10px] px-2 py-0.2 uppercase font-black tracking-wider">
+                      {lowStockCount} SKU{lowStockCount > 1 ? 's' : ''} Affected
+                    </span>
+                  </div>
+                  <p className="text-neutral-700 text-[11px] mt-0.5">
+                    <strong>{lowStockCount}</strong> product{lowStockCount > 1 ? 's have' : ' has'} inventory levels at or below your defined threshold of <strong>{lowStockThreshold} units</strong>. Re-order depot stock or adjust buffer.
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  id="btn-banner-toggle-filter"
+                  onClick={() => setFilterLowStockOnly(!filterLowStockOnly)}
+                  className="px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white text-[11px] font-mono font-black uppercase border border-black cursor-pointer shadow-xs active:translate-y-0.5"
+                >
+                  {filterLowStockOnly ? 'Show All Products' : 'Filter Low Stock SKUs'}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Dense Data Table */}
           <div className="border-2 border-black bg-white overflow-x-auto">
             <table id="table-products-master" className="w-full text-left border-collapse text-xs font-mono">
@@ -504,7 +740,7 @@ export function AdminView() {
                   <th className="p-3 border-r border-neutral-700 w-24">SKU</th>
                   <th className="p-3 border-r border-neutral-700 w-20">HSN</th>
                   <th className="p-3 border-r border-neutral-700">Product Name</th>
-                  <th className="p-3 border-r border-neutral-700 text-right w-32">Stock (Units)</th>
+                  <th className="p-3 border-r border-neutral-700 text-right w-36">Stock (Units)</th>
                   <th className="p-3 border-r border-neutral-700 text-right w-24">MRP (Retail)</th>
                   <th className="p-3 border-r border-neutral-700 text-right w-24">Wholesale</th>
                   <th className="p-3 border-r border-neutral-700 w-56">Offers & Schemes</th>
@@ -520,12 +756,21 @@ export function AdminView() {
                     ? Math.round((retailerMargin / product.retailPrice) * 100) 
                     : 0;
 
+                  const isOutOfStock = product.stock <= 0;
+                  const isLowStock = !isOutOfStock && product.stock <= lowStockThreshold;
+
                   return (
                     <tr
                       key={product.id}
                       id={`product-row-${product.id}`}
                       className={`hover:bg-neutral-50 transition-none ${
-                        isEditing ? 'bg-amber-50/70 ring-2 ring-black' : ''
+                        isEditing
+                          ? 'bg-amber-50/70 ring-2 ring-black'
+                          : isOutOfStock
+                          ? 'bg-red-50/70'
+                          : isLowStock
+                          ? 'bg-amber-50/60'
+                          : ''
                       }`}
                     >
                       {/* SKU */}
@@ -552,9 +797,30 @@ export function AdminView() {
                         )}
                       </td>
 
-                      {/* Product Name */}
+                      {/* Product Name & Alert Badge */}
                       <td className="p-3 border-r border-black font-sans">
-                        <div className="font-bold text-sm text-neutral-950">{product.name}</div>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-bold text-sm text-neutral-950">{product.name}</span>
+                          {/* Low Stock Alert Badges */}
+                          {isOutOfStock && (
+                            <span 
+                              id={`badge-out-of-stock-${product.id}`}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-red-700 text-white font-mono font-black text-[9px] uppercase border border-red-900"
+                            >
+                              <AlertTriangle className="w-2.5 h-2.5" />
+                              OUT OF STOCK
+                            </span>
+                          )}
+                          {isLowStock && (
+                            <span 
+                              id={`badge-low-stock-${product.id}`}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amber-100 text-red-900 font-mono font-black text-[9px] uppercase border-2 border-red-600 shadow-xs"
+                            >
+                              <AlertTriangle className="w-2.5 h-2.5 text-red-600" />
+                              LOW STOCK ALERT (≤{lowStockThreshold})
+                            </span>
+                          )}
+                        </div>
                         {product.focusNote && !isEditing && (
                           <div className="text-[11px] font-mono text-amber-900 mt-0.5">
                             ★ Note: {product.focusNote}
@@ -565,7 +831,7 @@ export function AdminView() {
                         </div>
                       </td>
 
-                      {/* Stock Column */}
+                      {/* Stock Column with High-Contrast Alert */}
                       <td className="p-3 border-r border-black text-right">
                         {isEditing ? (
                           <input
@@ -579,26 +845,42 @@ export function AdminView() {
                             className="w-20 border border-black px-1.5 py-1 text-right font-mono font-bold bg-white"
                           />
                         ) : (
-                          <div className="flex items-center justify-end gap-1.5">
-                            <button
-                              id={`btn-inline-dec-${product.id}`}
-                              onClick={() => handleInlineStockStep(product.id, product.stock, -10)}
-                              className="w-5 h-5 border border-neutral-400 bg-white hover:bg-neutral-200 text-[10px] flex items-center justify-center font-bold"
-                              title="Decrease 10"
-                            >
-                              -
-                            </button>
-                            <span className={`font-black text-sm ${product.stock < 50 ? 'text-amber-800' : 'text-black'}`}>
-                              {product.stock}
-                            </span>
-                            <button
-                              id={`btn-inline-inc-${product.id}`}
-                              onClick={() => handleInlineStockStep(product.id, product.stock, 10)}
-                              className="w-5 h-5 border border-neutral-400 bg-white hover:bg-neutral-200 text-[10px] flex items-center justify-center font-bold"
-                              title="Increase 10"
-                            >
-                              +
-                            </button>
+                          <div className="flex flex-col items-end gap-1">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <button
+                                id={`btn-inline-dec-${product.id}`}
+                                onClick={() => handleInlineStockStep(product.id, product.stock, -10)}
+                                className="w-5 h-5 border border-neutral-400 bg-white hover:bg-neutral-200 text-[10px] flex items-center justify-center font-bold"
+                                title="Decrease 10"
+                              >
+                                -
+                              </button>
+                              <span 
+                                id={`stock-units-${product.id}`}
+                                className={`font-black text-sm px-1.5 py-0.5 border ${
+                                  isOutOfStock
+                                    ? 'text-red-700 bg-red-100 border-red-500'
+                                    : isLowStock
+                                    ? 'text-red-900 bg-amber-100 border-2 border-red-600'
+                                    : 'text-black border-transparent'
+                                }`}
+                              >
+                                {product.stock}
+                              </span>
+                              <button
+                                id={`btn-inline-inc-${product.id}`}
+                                onClick={() => handleInlineStockStep(product.id, product.stock, 10)}
+                                className="w-5 h-5 border border-neutral-400 bg-white hover:bg-neutral-200 text-[10px] flex items-center justify-center font-bold"
+                                title="Increase 10"
+                              >
+                                +
+                              </button>
+                            </div>
+                            {isLowStock && (
+                              <span className="text-[9px] font-mono font-bold text-red-700 uppercase">
+                                Critical Buffer
+                              </span>
+                            )}
                           </div>
                         )}
                       </td>
@@ -804,41 +1086,56 @@ export function AdminView() {
               </p>
             </div>
 
-            {/* Filter buttons */}
-            <div className="flex items-center gap-1 font-mono text-xs">
-              <span className="text-neutral-500 uppercase font-bold text-[11px] mr-1">Filter:</span>
+            {/* Filter buttons & CSV Export Button */}
+            <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
+              <div className="flex items-center gap-1">
+                <span className="text-neutral-500 uppercase font-bold text-[11px] mr-1">Filter:</span>
+                <button
+                  id="filter-orders-all"
+                  onClick={() => setOrderFilter('ALL')}
+                  className={`px-2.5 py-1 uppercase font-bold border ${
+                    orderFilter === 'ALL'
+                      ? 'bg-black text-white border-black'
+                      : 'bg-white text-black border-neutral-300 hover:border-black'
+                  }`}
+                >
+                  All ({orders.length})
+                </button>
+                <button
+                  id="filter-orders-wholesale"
+                  onClick={() => setOrderFilter('wholesale')}
+                  className={`px-2.5 py-1 uppercase font-bold border ${
+                    orderFilter === 'wholesale'
+                      ? 'bg-blue-700 text-white border-blue-800'
+                      : 'bg-white text-blue-800 border-neutral-300 hover:border-blue-700'
+                  }`}
+                >
+                  Wholesale ({orders.filter((o) => o.orderType === 'wholesale').length})
+                </button>
+                <button
+                  id="filter-orders-retail"
+                  onClick={() => setOrderFilter('retail')}
+                  className={`px-2.5 py-1 uppercase font-bold border ${
+                    orderFilter === 'retail'
+                      ? 'bg-emerald-700 text-white border-emerald-800'
+                      : 'bg-white text-emerald-800 border-neutral-300 hover:border-emerald-700'
+                  }`}
+                >
+                  Retail ({orders.filter((o) => o.orderType === 'retail').length})
+                </button>
+              </div>
+
+              {/* Export to CSV Button for Accounting Backup */}
               <button
-                id="filter-orders-all"
-                onClick={() => setOrderFilter('ALL')}
-                className={`px-2.5 py-1 uppercase font-bold border ${
-                  orderFilter === 'ALL'
-                    ? 'bg-black text-white border-black'
-                    : 'bg-white text-black border-neutral-300 hover:border-black'
-                }`}
+                type="button"
+                id="btn-export-orders-csv"
+                onClick={handleExportOrdersCSV}
+                className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white font-mono font-black text-xs uppercase tracking-wider border-2 border-black flex items-center gap-1.5 cursor-pointer shadow-xs active:translate-y-0.5 ml-auto transition-none"
+                title="Export current orders ledger to CSV spreadsheet for manual accounting backup"
               >
-                All ({orders.length})
-              </button>
-              <button
-                id="filter-orders-wholesale"
-                onClick={() => setOrderFilter('wholesale')}
-                className={`px-2.5 py-1 uppercase font-bold border ${
-                  orderFilter === 'wholesale'
-                    ? 'bg-blue-700 text-white border-blue-800'
-                    : 'bg-white text-blue-800 border-neutral-300 hover:border-blue-700'
-                }`}
-              >
-                Wholesale ({orders.filter((o) => o.orderType === 'wholesale').length})
-              </button>
-              <button
-                id="filter-orders-retail"
-                onClick={() => setOrderFilter('retail')}
-                className={`px-2.5 py-1 uppercase font-bold border ${
-                  orderFilter === 'retail'
-                    ? 'bg-emerald-700 text-white border-emerald-800'
-                    : 'bg-white text-emerald-800 border-neutral-300 hover:border-emerald-700'
-                }`}
-              >
-                Retail ({orders.filter((o) => o.orderType === 'retail').length})
+                <FileSpreadsheet className="w-4 h-4 text-emerald-200" />
+                <Download className="w-3.5 h-3.5 text-white" />
+                <span>Export CSV Backup</span>
               </button>
             </div>
           </div>
@@ -2244,12 +2541,14 @@ export function AdminView() {
       )}
 
       {/* Invoice Modal for Viewing and PDF generation */}
-      <InvoiceModal
-        order={selectedInvoiceOrder}
-        isOpen={!!selectedInvoiceOrder}
-        onClose={() => setSelectedInvoiceOrder(null)}
-        autoPrint={autoPrintInvoice}
-      />
+      {selectedInvoiceOrder && (
+        <InvoiceModal
+          order={selectedInvoiceOrder}
+          isOpen={true}
+          onClose={() => setSelectedInvoiceOrder(null)}
+          autoPrint={autoPrintInvoice}
+        />
+      )}
     </div>
   );
 }

@@ -1,5 +1,5 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { Product, Salesman, Order, Issue, RoleRoute, AuthUser, CompanyProfile } from '../types.ts';
+import { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
+import { Product, Salesman, Order, Issue, RoleRoute, AuthUser, CompanyProfile, SyncQueueItem, SyncActionType } from '../types.ts';
 
 const DEFAULT_COMPANY_PROFILE: CompanyProfile = {
   companyName: 'Apex FMCG Distributors Pvt. Ltd.',
@@ -196,6 +196,12 @@ interface AppContextType {
   updateIssueStatus: (issueId: string, status: Issue['status']) => void;
   recordCollection: (amount: number, salesmanId?: string) => void;
   resetDemoData: () => void;
+  // Offline-First Synchronization
+  syncQueue: SyncQueueItem[];
+  syncPendingItems: () => Promise<void>;
+  isSyncing: boolean;
+  lastSyncTime: string | null;
+  clearSyncedQueue: () => void;
 }
 
 const STORAGE_KEYS = {
@@ -206,6 +212,8 @@ const STORAGE_KEYS = {
   ISSUES: 'fmcg_issues_v2',
   MOBILE_PREVIEW: 'fmcg_mobile_preview_v2',
   COMPANY_PROFILE: 'fmcg_company_profile_v2',
+  SYNC_QUEUE: 'fmcg_sync_queue_v2',
+  LAST_SYNC_TIME: 'fmcg_last_sync_time_v2',
 };
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -296,6 +304,96 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return false;
   });
 
+  // Offline Synchronization Queue & Ledger
+  const [syncQueue, setSyncQueue] = useState<SyncQueueItem[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.SYNC_QUEUE);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {
+      console.error('Failed to parse sync queue from localStorage', e);
+    }
+    return [];
+  });
+
+  const [lastSyncTime, setLastSyncTime] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(STORAGE_KEYS.LAST_SYNC_TIME);
+    } catch {
+      return null;
+    }
+  });
+
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+
+  // Sync queue to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.SYNC_QUEUE, JSON.stringify(syncQueue));
+    } catch (e) {
+      console.error('Error saving sync queue to localStorage', e);
+    }
+  }, [syncQueue]);
+
+  useEffect(() => {
+    try {
+      if (lastSyncTime) {
+        localStorage.setItem(STORAGE_KEYS.LAST_SYNC_TIME, lastSyncTime);
+      }
+    } catch (e) {
+      console.error('Error saving last sync time', e);
+    }
+  }, [lastSyncTime]);
+
+  const enqueueSyncAction = useCallback((action: SyncActionType, payload: unknown, description: string) => {
+    const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+    const newItem: SyncQueueItem = {
+      id: `sync-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      action,
+      payload,
+      timestamp: new Date().toISOString(),
+      status: isOnline ? 'SYNCED' : 'PENDING',
+      retryCount: 0,
+      description,
+    };
+
+    setSyncQueue((prev) => [newItem, ...prev.slice(0, 49)]); // keep latest 50 records in ledger
+    if (isOnline) {
+      setLastSyncTime(new Date().toISOString());
+    }
+  }, []);
+
+  const syncPendingItems = useCallback(async () => {
+    const pending = syncQueue.filter((item) => item.status === 'PENDING');
+    if (pending.length === 0) return;
+
+    setIsSyncing(true);
+    // Simulate server synchronization broadcast
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    setSyncQueue((prev) =>
+      prev.map((item) => (item.status === 'PENDING' ? { ...item, status: 'SYNCED' } : item))
+    );
+    const now = new Date().toISOString();
+    setLastSyncTime(now);
+    setIsSyncing(false);
+  }, [syncQueue]);
+
+  // Automatic online synchronization: when network comes back online, flush pending sync items
+  useEffect(() => {
+    const handleOnline = () => {
+      setTimeout(() => {
+        syncPendingItems();
+      }, 1000);
+    };
+
+    window.addEventListener('online', handleOnline);
+    return () => window.removeEventListener('online', handleOnline);
+  }, [syncPendingItems]);
+
+  const clearSyncedQueue = useCallback(() => {
+    setSyncQueue((prev) => prev.filter((item) => item.status === 'PENDING'));
+  }, []);
+
   // Current active salesman computed from currentUser or fallback to first salesman
   const activeSalesman = (currentUser?.role === 'SALESMAN' && currentUser.salesmanId)
     ? (salesmen.find((s) => s.id === currentUser.salesmanId) || salesmen[0])
@@ -382,12 +480,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const cleanUser = usernameInput.trim().toLowerCase();
     const cleanPass = passwordInput.trim();
 
-    // 1. Check Admin Credentials: admin / admin123
-    if (cleanUser === 'admin' && cleanPass === 'admin123') {
+    // 1. Check Admin Credentials: ShivShakti / SST321#
+    if (cleanUser === 'shivshakti' && cleanPass === 'SST321#') {
       const adminUser: AuthUser = {
         id: 'usr-admin',
-        name: 'Super Stockist Administrator',
-        username: 'admin',
+        name: 'ShivShakti',
+        username: 'ShivShakti',
         role: 'ADMIN',
       };
       setCurrentUser(adminUser);
@@ -395,7 +493,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return { success: true };
     }
 
-    // 2. Check Salesman Accounts (dynamic and demo: rahul / 123, vikas / 123, etc.)
+    // 2. Check Salesman Accounts
     const foundSalesman = salesmen.find(
       (s) => s.username.toLowerCase() === cleanUser && (s.password === cleanPass || (!s.password && cleanPass === '123'))
     );
@@ -415,7 +513,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     return {
       success: false,
-      message: 'Invalid credentials. Please enter a valid username/password or use demo credentials.',
+      message: 'Invalid credentials. Please enter a valid username and password.',
     };
   };
 
@@ -438,9 +536,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   };
 
   const updateStock = (productId: string, newStock: number) => {
+    const finalStock = Math.max(0, newStock);
     setProducts((prev) =>
-      prev.map((p) => (p.id === productId ? { ...p, stock: Math.max(0, newStock) } : p))
+      prev.map((p) => (p.id === productId ? { ...p, stock: finalStock } : p))
     );
+    enqueueSyncAction('UPDATE_STOCK', { productId, newStock: finalStock }, `Updated stock for SKU ${productId} to ${finalStock} units`);
   };
 
   const toggleFocusProduct = (productId: string, note?: string) => {
@@ -461,13 +561,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const addProduct = (productData: Omit<Product, 'id'>) => {
     const newId = `p${Date.now().toString().slice(-4)}`;
-    setProducts((prev) => [...prev, { ...productData, id: newId }]);
+    const newProduct = { ...productData, id: newId };
+    setProducts((prev) => [...prev, newProduct]);
+    enqueueSyncAction('UPDATE_PRODUCT', newProduct, `Added new SKU: ${newProduct.name} (${newProduct.sku})`);
   };
 
   const updateProduct = (productId: string, updates: Partial<Product>) => {
     setProducts((prev) =>
       prev.map((p) => (p.id === productId ? { ...p, ...updates } : p))
     );
+    enqueueSyncAction('UPDATE_PRODUCT', { productId, updates }, `Updated product details for SKU ${productId}`);
   };
 
   const updateSalesmanTargets = (salesmanId: string, targetSales: number, targetCollection: number) => {
@@ -482,6 +585,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           : s
       )
     );
+    enqueueSyncAction('UPDATE_SALESMAN_TARGETS', { salesmanId, targetSales, targetCollection }, `Updated targets for salesman ${salesmanId}`);
   };
 
   const createSalesman = (data: {
@@ -498,7 +602,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!data.name.trim()) {
       return { success: false, message: 'Salesman Name is required' };
     }
-    if (cleanUsername === 'admin' || salesmen.some((s) => s.username.toLowerCase() === cleanUsername)) {
+    if (cleanUsername === 'admin' || cleanUsername === 'shivshakti' || salesmen.some((s) => s.username.toLowerCase() === cleanUsername)) {
       return { success: false, message: `Username "${data.username}" is already taken. Please choose another.` };
     }
 
@@ -515,6 +619,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     };
 
     setSalesmen((prev) => [...prev, newSalesman]);
+    enqueueSyncAction('UPDATE_SALESMAN_TARGETS', newSalesman, `Created salesman account: ${newSalesman.name} (@${newSalesman.username})`);
     return { success: true };
   };
 
@@ -557,6 +662,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
       );
     }
 
+    // Record in local-first sync queue
+    enqueueSyncAction(
+      'CREATE_ORDER', 
+      newOrder, 
+      `Order ${newOrderId} (${newOrder.orderType || 'wholesale'}) for ${newOrder.storeName || 'Walk-in'} - ₹${newOrder.totalAmount}`
+    );
+
     return newOrderId;
   };
 
@@ -564,6 +676,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setOrders((prev) =>
       prev.map((o) => (o.id === orderId ? { ...o, status } : o))
     );
+    enqueueSyncAction('UPDATE_ORDER_STATUS', { orderId, status }, `Order ${orderId} status changed to ${status}`);
   };
 
   const addIssue = (issueData: Omit<Issue, 'id' | 'timestamp'>) => {
@@ -573,12 +686,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       timestamp: new Date().toISOString().replace('T', ' ').slice(0, 16),
     };
     setIssues((prev) => [newIssue, ...prev]);
+    enqueueSyncAction('ADD_ISSUE', newIssue, `Field dispute logged: ${newIssue.category} (${newIssue.shopName})`);
   };
 
   const updateIssueStatus = (issueId: string, status: Issue['status']) => {
     setIssues((prev) =>
       prev.map((i) => (i.id === issueId ? { ...i, status } : i))
     );
+    enqueueSyncAction('UPDATE_ISSUE_STATUS', { issueId, status }, `Dispute ${issueId} resolved to ${status}`);
   };
 
   const recordCollection = (amount: number, targetSalesmanId?: string) => {
@@ -590,6 +705,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           : s
       )
     );
+    enqueueSyncAction('RECORD_COLLECTION', { amount, targetSalesmanId: sid }, `Payment collected ₹${amount} for agent ${sid}`);
   };
 
   const resetDemoData = () => {
@@ -598,12 +714,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setOrders(INITIAL_ORDERS);
     setIssues(INITIAL_ISSUES);
     setCompanyProfile(DEFAULT_COMPANY_PROFILE);
+    setSyncQueue([]);
+    setLastSyncTime(null);
     try {
       localStorage.removeItem(STORAGE_KEYS.PRODUCTS);
       localStorage.removeItem(STORAGE_KEYS.SALESMEN);
       localStorage.removeItem(STORAGE_KEYS.ORDERS);
       localStorage.removeItem(STORAGE_KEYS.ISSUES);
       localStorage.removeItem(STORAGE_KEYS.COMPANY_PROFILE);
+      localStorage.removeItem(STORAGE_KEYS.SYNC_QUEUE);
+      localStorage.removeItem(STORAGE_KEYS.LAST_SYNC_TIME);
     } catch (e) {
       console.error('Error clearing demo data', e);
     }
@@ -638,6 +758,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
         updateIssueStatus,
         recordCollection,
         resetDemoData,
+        syncQueue,
+        syncPendingItems,
+        isSyncing,
+        lastSyncTime,
+        clearSyncedQueue,
       }}
     >
       {children}
@@ -652,3 +777,6 @@ export function useApp() {
   }
   return context;
 }
+
+export const useAppContext = useApp;
+

@@ -8,11 +8,27 @@ import { Header } from './components/Header.tsx';
 import { LoginScreen } from './components/LoginScreen.tsx';
 import { AdminView } from './pages/AdminView.tsx';
 import { SalesmanView } from './pages/SalesmanView.tsx';
+import { RetailStorefront } from './components/RetailStorefront.tsx';
 
 function MainRouter() {
-  const { currentUser, isMobilePreview, setIsMobilePreview } = useApp();
+  const { currentUser, isMobilePreview, setIsMobilePreview, currentRoute, setCurrentRoute } = useApp();
 
-  // 1. Unified Login Gate (Default Screen on Refresh/Open if not authenticated)
+  // 1. Customer Retail Storefront (Direct Guest Browsing or Staff Preview)
+  if (currentRoute === '/store') {
+    return (
+      <RetailStorefront
+        onBackToLogin={() => {
+          if (currentUser) {
+            setCurrentRoute(currentUser.role === 'ADMIN' ? '/admin' : '/salesman');
+          } else {
+            setCurrentRoute('/admin');
+          }
+        }}
+      />
+    );
+  }
+
+  // 2. Unified Login Gate (Default Screen on Refresh/Open if not authenticated)
   if (!currentUser) {
     return <LoginScreen />;
   }

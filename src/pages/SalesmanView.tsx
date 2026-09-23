@@ -990,12 +990,14 @@ export function SalesmanView() {
       )}
 
       {/* Invoice Modal for Viewing and PDF generation */}
-      <InvoiceModal
-        order={selectedInvoiceOrder}
-        isOpen={!!selectedInvoiceOrder}
-        onClose={() => setSelectedInvoiceOrder(null)}
-        autoPrint={autoPrintInvoice}
-      />
+      {selectedInvoiceOrder && (
+        <InvoiceModal
+          order={selectedInvoiceOrder}
+          isOpen={true}
+          onClose={() => setSelectedInvoiceOrder(null)}
+          autoPrint={autoPrintInvoice}
+        />
+      )}
     </div>
   );
 }

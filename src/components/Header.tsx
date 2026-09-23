@@ -1,31 +1,27 @@
 import { useApp } from '../context/AppContext.tsx';
-import { Building2, Briefcase, Zap, RefreshCw, LogOut, UserCheck } from 'lucide-react';
+import { Building2, Briefcase, LogOut, UserCheck, ShoppingBag } from 'lucide-react';
 import { HeaderMetricsBar } from './HeaderMetricsBar.tsx';
+import { OfflineSyncBadge } from './OfflineSyncBadge.tsx';
+import { PWAInstallButton } from './PWAInstallButton.tsx';
 
 export function Header() {
-  const { currentUser, logout, salesman } = useApp();
+  const { currentUser, logout, salesman, setCurrentRoute } = useApp();
 
   const isAdmin = currentUser?.role === 'ADMIN';
 
   return (
     <header id="app-persistent-header" className="w-full bg-white border-b-2 border-black sticky top-0 z-50">
-      {/* Top utility sub-bar */}
-      <div id="header-system-bar" className="bg-neutral-950 text-white px-3 py-1.5 flex flex-wrap items-center justify-between text-xs font-mono border-b border-black">
+      {/* Top utility sub-bar with live offline status, sync queue and PWA installer */}
+      <div id="header-system-bar" className="bg-neutral-950 text-white px-3 py-1.5 flex flex-wrap items-center justify-between text-xs font-mono border-b border-black gap-2">
         <div className="flex items-center gap-2">
           <span className="inline-block w-2 h-2 bg-emerald-400"></span>
           <span className="font-bold tracking-wider uppercase text-neutral-100">B2B FMCG DISTRO OS</span>
           <span className="text-neutral-400">|</span>
           <span className="text-neutral-300 hidden sm:inline">AUTHENTICATED ROLE ISOLATION</span>
         </div>
-        <div className="flex items-center gap-3">
-          <span id="badge-network-status" className="flex items-center gap-1 bg-neutral-800 px-2 py-0.5 border border-neutral-700 text-neutral-200">
-            <Zap className="w-3 h-3 text-amber-400" />
-            <span>3G ZERO-LATENCY</span>
-          </span>
-          <span id="badge-sync-status" className="flex items-center gap-1 bg-neutral-800 px-2 py-0.5 border border-neutral-700 text-neutral-300">
-            <RefreshCw className="w-3 h-3 text-cyan-400" />
-            <span>SESSION LOCKED</span>
-          </span>
+        <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+          <PWAInstallButton variant="header" />
+          <OfflineSyncBadge />
         </div>
       </div>
 
@@ -55,8 +51,19 @@ export function Header() {
           </div>
         </div>
 
-        {/* Authenticated User Status and Persistent Logout Button */}
+        {/* Authenticated User Status, Store Preview, and Persistent Logout Button */}
         <div className="flex items-center gap-2 sm:gap-3 ml-auto md:ml-0 font-mono text-xs">
+          <button
+            type="button"
+            id="btn-header-preview-store"
+            onClick={() => setCurrentRoute('/store')}
+            className="flex items-center gap-1.5 px-2.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white font-mono font-black text-xs uppercase tracking-wider border-2 border-black cursor-pointer shadow-sm active:translate-y-0.5"
+            title="Preview live customer retail storefront"
+          >
+            <ShoppingBag className="w-3.5 h-3.5 text-amber-300" />
+            <span className="hidden sm:inline">Customer Storefront</span>
+          </button>
+
           <div className="bg-white border-2 border-black px-2.5 py-1.5 flex items-center gap-2">
             <UserCheck className="w-4 h-4 text-emerald-600 flex-shrink-0" />
             <div>

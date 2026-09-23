@@ -96,3 +96,31 @@ export interface Issue {
 }
 
 export type RoleRoute = '/admin' | '/salesman' | '/store';
+
+export type SyncActionType = 
+  | 'CREATE_ORDER' 
+  | 'UPDATE_ORDER_STATUS' 
+  | 'UPDATE_STOCK' 
+  | 'RECORD_COLLECTION' 
+  | 'ADD_ISSUE' 
+  | 'UPDATE_ISSUE_STATUS'
+  | 'UPDATE_PRODUCT'
+  | 'UPDATE_SALESMAN_TARGETS';
+
+export interface SyncQueueItem {
+  id: string;
+  action: SyncActionType;
+  payload: unknown;
+  timestamp: string;
+  status: 'PENDING' | 'SYNCED' | 'FAILED';
+  retryCount: number;
+  description: string;
+}
+
+export interface SyncLedgerSummary {
+  lastSyncTime: string | null;
+  pendingCount: number;
+  isSyncing: boolean;
+  offlineMode: boolean;
+}
+

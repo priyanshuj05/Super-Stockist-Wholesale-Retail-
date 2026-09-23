@@ -27,12 +27,10 @@ interface InvoiceModalProps {
 
 export function InvoiceModal({ order, isOpen = true, onClose, autoPrint = false }: InvoiceModalProps) {
   const { companyProfile } = useApp();
-  
-  if (!isOpen || !order) return null;
 
   // Design templates: 'gst_tax_invoice' | 'modern_minimalist' | 'compact_slip'
   const [template, setTemplate] = useState<InvoiceTemplateId>(
-    order.orderType === 'wholesale' ? 'gst_tax_invoice' : 'modern_minimalist'
+    order?.orderType === 'wholesale' ? 'gst_tax_invoice' : 'modern_minimalist'
   );
 
   // Color accents: 'slate' | 'navy' | 'emerald' | 'crimson'
@@ -40,15 +38,25 @@ export function InvoiceModal({ order, isOpen = true, onClose, autoPrint = false 
 
   const [copiedNotification, setCopiedNotification] = useState(false);
 
+  // Sync template when order changes
+  useEffect(() => {
+    if (order) {
+      setTemplate(order.orderType === 'wholesale' ? 'gst_tax_invoice' : 'modern_minimalist');
+    }
+  }, [order?.id, order?.orderType]);
+
   // Auto trigger print if requested
   useEffect(() => {
-    if (autoPrint) {
+    if (autoPrint && isOpen && order) {
       const timer = setTimeout(() => {
         window.print();
       }, 350);
       return () => clearTimeout(timer);
     }
-  }, [autoPrint]);
+  }, [autoPrint, isOpen, order]);
+
+  // Return early AFTER all hooks have executed
+  if (!isOpen || !order) return null;
 
   // Color accent mappings
   const accentStyles = {
