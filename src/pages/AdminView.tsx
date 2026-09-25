@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { Product, Order, CompanyProfile } from '../types.ts';
 import { InvoiceModal } from '../components/InvoiceModal.tsx';
+import { UpiCheckoutModal } from '../components/UpiCheckoutModal.tsx';
 import { 
   Package, 
   Plus, 
@@ -33,8 +34,21 @@ import {
   Tag,
   Gift,
   Download,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Cloud,
+  ExternalLink,
+  RefreshCw,
+  Zap,
+  Flame
 } from 'lucide-react';
+import { GoogleDrivePanel } from '../components/GoogleDrivePanel.tsx';
+import { GoogleDriveProductSyncModal } from '../components/GoogleDriveProductSyncModal.tsx';
+import { CsvProductImportModal } from '../components/CsvProductImportModal.tsx';
+import { 
+  generateProductCatalogCsv, 
+  downloadCsvFile, 
+  parseProductCatalogFromText 
+} from '../services/googleDriveApi.ts';
 
 export function AdminView() {
   const { 
@@ -50,19 +64,29 @@ export function AdminView() {
     toggleFocusProduct, 
     addProduct,
     updateProduct,
+    importProducts,
     updateSalesmanTargets,
     createSalesman,
     updateOrderStatus,
-    updateIssueStatus 
+    updateOrderPaymentStatus,
+    updateIssueStatus,
+    syncGoogleDriveCatalog,
+    isDriveSyncing,
+    lastDriveSyncTime,
+    driveSyncStatus,
+    clearDriveSyncStatus
   } = useApp();
 
-  // 6 Sub-Navigation Tabs: products, orders, salesman, accounts, issues, company
-  const [activeTab, setActiveTab] = useState<'products' | 'orders' | 'salesman' | 'accounts' | 'company' | 'issues'>('products');
+  // Sub-Navigation Tabs: products, orders, salesman, accounts, issues, company, drive
+  const [activeTab, setActiveTab] = useState<'products' | 'orders' | 'salesman' | 'accounts' | 'company' | 'issues' | 'drive'>('products');
   const [orderFilter, setOrderFilter] = useState<'ALL' | 'wholesale' | 'retail'>('ALL');
 
-  // Selected Order for Invoice Modal
+  // Selected Order for Invoice Modal & Dynamic UPI QR Modal
   const [selectedInvoiceOrder, setSelectedInvoiceOrder] = useState<Order | null>(null);
   const [autoPrintInvoice, setAutoPrintInvoice] = useState<boolean>(false);
+  const [selectedUpiOrder, setSelectedUpiOrder] = useState<Order | null>(null);
+  const [ordersExportNotice, setOrdersExportNotice] = useState<string>('');
+  const [issuesExportNotice, setIssuesExportNotice] = useState<string>('');
 
   // Company Setup Form State
   const [companyForm, setCompanyForm] = useState<CompanyProfile>(companyProfile);
@@ -106,6 +130,12 @@ export function AdminView() {
 
   // Add Product Modal State
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showDriveSyncModal, setShowDriveSyncModal] = useState(false);
+  const [showCsvImportModal, setShowCsvImportModal] = useState(false);
+  const [csvImportInitialMode, setCsvImportInitialMode] = useState<'file' | 'drive' | 'paste'>('file');
+  const [csvQuickNotification, setCsvQuickNotification] = useState<string | null>(null);
+  const quickCsvInputRef = useRef<HTMLInputElement>(null);
+
   const [newProductName, setNewProductName] = useState('');
   const [newProductSku, setNewProductSku] = useState('');
   const [newProductHsn, setNewProductHsn] = useState('2106');
@@ -117,6 +147,40 @@ export function AdminView() {
   const [newIsFocus, setNewIsFocus] = useState(false);
   const [newFocusNote, setNewFocusNote] = useState('');
   const [addError, setAddError] = useState('');
+
+  // Handler: Quick CSV file upload from local machine
+  const handleQuickCsvUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const text = evt.target?.result as string;
+      if (!text) return;
+      try {
+        const items = parseProductCatalogFromText(text);
+        if (items.length > 0) {
+          const { added, updated } = importProducts(items, 'merge');
+          setCsvQuickNotification(`✓ Successfully imported ${added + updated} products (${added} new, ${updated} updated) from ${file.name}`);
+          setTimeout(() => setCsvQuickNotification(null), 6000);
+        } else {
+          setCsvImportInitialMode('file');
+          setShowCsvImportModal(true);
+        }
+      } catch {
+        setCsvImportInitialMode('file');
+        setShowCsvImportModal(true);
+      }
+    };
+    reader.readAsText(file);
+    if (quickCsvInputRef.current) quickCsvInputRef.current.value = '';
+  };
+
+  // Handler: Export current products master catalog to CSV
+  const handleExportProductsCsv = () => {
+    const csv = generateProductCatalogCsv(products);
+    const dateStr = new Date().toISOString().split('T')[0];
+    downloadCsvFile(`Depot_Product_Master_${dateStr}.csv`, csv);
+  };
 
   // Row Edit State (Inline / Modal Editing)
   const [editingProductId, setEditingProductId] = useState<string | null>(null);
@@ -139,6 +203,10 @@ export function AdminView() {
     wholesaleScheme: '',
     retailOffer: '',
   });
+
+  // Quick Inline Focus Note State for Daily Huddle Directives
+  const [editingFocusNoteId, setEditingFocusNoteId] = useState<string | null>(null);
+  const [inlineFocusNote, setInlineFocusNote] = useState('');
 
   // Salesman Targets Edit State
   const [targetSalesInput, setTargetSalesInput] = useState<number>(activeManagedSalesman.targetSales);
@@ -346,7 +414,8 @@ export function AdminView() {
       : orders.filter((o) => (o.orderType || 'wholesale') === orderFilter);
 
     if (targetOrders.length === 0) {
-      alert('No orders available in the selected filter to export.');
+      setOrdersExportNotice('No orders available in the selected filter to export.');
+      setTimeout(() => setOrdersExportNotice(''), 4000);
       return;
     }
 
@@ -411,6 +480,117 @@ export function AdminView() {
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+    setOrdersExportNotice(`✓ Successfully exported ${targetOrders.length} order(s) to CSV!`);
+    setTimeout(() => setOrdersExportNotice(''), 4500);
+  };
+
+  // Handler: Export current field ticket logs as CSV or formatted JSON for external audit
+  const handleExportIssues = (format: 'csv' | 'json') => {
+    if (issues.length === 0) {
+      setIssuesExportNotice('No ticket logs available to export.');
+      setTimeout(() => setIssuesExportNotice(''), 4000);
+      return;
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dateStr = new Date().toISOString().split('T')[0];
+
+    if (format === 'csv') {
+      const headers = [
+        'Ticket ID',
+        'Date & Time',
+        'Sales Representative',
+        'Retailer / Shop Name',
+        'Issue Category',
+        'Detailed Description',
+        'Current Status',
+        'Audit Compliance Flag'
+      ];
+
+      const escapeCsv = (val: string | number | undefined | null) => {
+        if (val === undefined || val === null) return '""';
+        const str = String(val).replace(/"/g, '""');
+        return `"${str}"`;
+      };
+
+      const rows = issues.map((iss) => [
+        escapeCsv(iss.id),
+        escapeCsv(iss.timestamp),
+        escapeCsv(iss.salesmanName),
+        escapeCsv(iss.shopName),
+        escapeCsv(iss.category),
+        escapeCsv(iss.description),
+        escapeCsv(iss.status),
+        escapeCsv(iss.status === 'RESOLVED' ? 'CLOSED_RESOLVED' : iss.status === 'UNDER_REVIEW' ? 'PENDING_SUPERVISOR_ACTION' : 'UNRESOLVED_ESCALATED')
+      ].join(','));
+
+      const csvContent = '\uFEFF' + [headers.join(','), ...rows].join('\r\n');
+      const filename = `FMCG_Field_Tickets_Audit_${dateStr}_${timestamp.slice(11, 19)}.csv`;
+
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', filename);
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      setIssuesExportNotice(`✓ Successfully exported all ${issues.length} ticket logs as CSV ("${filename}") for external audit!`);
+      setTimeout(() => setIssuesExportNotice(''), 5000);
+    } else {
+      // Formatted JSON export for audit
+      const auditPayload = {
+        auditDocumentTitle: 'FMCG Field Tickets & Retailer Disputes External Audit Log',
+        exportedAt: new Date().toISOString(),
+        exportedBy: 'Depot Super Stockist Admin',
+        companyProfile: {
+          companyName: companyProfile.companyName,
+          gstin: companyProfile.gstin,
+          businessAddress: companyProfile.businessAddress,
+          contactNumber: companyProfile.contactNumber,
+          email: companyProfile.email
+        },
+        auditSummary: {
+          totalTickets: issues.length,
+          openDisputes: issues.filter((i) => i.status === 'OPEN').length,
+          underReview: issues.filter((i) => i.status === 'UNDER_REVIEW').length,
+          resolvedDisputes: issues.filter((i) => i.status === 'RESOLVED').length,
+          categoryBreakdown: issues.reduce((acc, iss) => {
+            acc[iss.category] = (acc[iss.category] || 0) + 1;
+            return acc;
+          }, {} as Record<string, number>)
+        },
+        ticketLogs: issues.map((iss) => ({
+          ticketId: iss.id,
+          reportedAt: iss.timestamp,
+          salesRepresentative: iss.salesmanName,
+          retailerShopName: iss.shopName,
+          category: iss.category,
+          description: iss.description,
+          status: iss.status,
+          auditCompliance: iss.status === 'RESOLVED' ? 'COMPLIANT_RESOLVED' : 'ACTION_REQUIRED'
+        }))
+      };
+
+      const filename = `FMCG_Field_Tickets_Audit_${dateStr}_${timestamp.slice(11, 19)}.json`;
+      const jsonContent = JSON.stringify(auditPayload, null, 2);
+      const blob = new Blob([jsonContent], { type: 'application/json;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', filename);
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      setIssuesExportNotice(`✓ Successfully exported all ${issues.length} ticket logs as formatted JSON ("${filename}") for external audit!`);
+      setTimeout(() => setIssuesExportNotice(''), 5000);
+    }
   };
 
   // Low Stock Calculation
@@ -604,6 +784,22 @@ export function AdminView() {
             </span>
           )}
         </button>
+
+        <button
+          id="admin-subtab-drive"
+          onClick={() => setActiveTab('drive')}
+          className={`px-4 py-2.5 font-mono text-xs sm:text-sm font-black uppercase border-2 flex items-center gap-2 cursor-pointer transition-none ${
+            activeTab === 'drive'
+              ? 'bg-black text-white border-black ring-1 ring-black'
+              : 'bg-white text-neutral-800 border-neutral-400 hover:border-black'
+          }`}
+        >
+          <Cloud className={`w-4 h-4 ${activeTab === 'drive' ? 'text-amber-400' : 'text-blue-600'}`} />
+          <span>Tab 7: Google Drive Cloud</span>
+          <span className={`px-1.5 py-0.2 text-[10px] font-black ${activeTab === 'drive' ? 'bg-amber-400 text-black' : 'bg-neutral-200 text-black'}`}>
+            WORKSPACE
+          </span>
+        </button>
       </div>
 
       {/* ========================================================================= */}
@@ -686,6 +882,71 @@ export function AdminView() {
                 <span>Low Stock Only ({lowStockCount})</span>
               </button>
 
+              {/* Quick CSV File Picker Input */}
+              <input
+                ref={quickCsvInputRef}
+                type="file"
+                id="input-quick-csv-product-file"
+                accept=".csv,.tsv,.txt"
+                onChange={handleQuickCsvUpload}
+                className="hidden"
+              />
+
+              {/* One-Click Quick 'Sync Now' Action Button */}
+              <button
+                type="button"
+                id="btn-quick-sync-drive-now"
+                disabled={isDriveSyncing}
+                onClick={() => syncGoogleDriveCatalog()}
+                className="px-3.5 py-2 bg-amber-400 hover:bg-amber-300 disabled:bg-neutral-200 text-black border-2 border-black text-xs font-mono font-black uppercase cursor-pointer disabled:cursor-not-allowed flex items-center gap-1.5 shadow-xs transition-none"
+                title="Fetch and re-parse Google Drive CSV catalog automatically (also listens to URL ?sync=now and window 'sync-now' event)"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 text-black ${isDriveSyncing ? 'animate-spin' : ''}`} />
+                <span>{isDriveSyncing ? 'Syncing...' : 'Sync Now'}</span>
+              </button>
+
+              {/* Import CSV / Drive Data Button */}
+              <button
+                type="button"
+                id="btn-import-csv-products"
+                onClick={() => {
+                  setCsvImportInitialMode('file');
+                  setShowCsvImportModal(true);
+                }}
+                className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white border-2 border-black text-xs font-mono font-black uppercase cursor-pointer flex items-center gap-1.5 shadow-xs transition-none"
+                title="Import & parse product details from CSV, Google Sheets, or Google Drive folder"
+              >
+                <FileSpreadsheet className="w-4 h-4 text-white" />
+                <span>Import CSV</span>
+              </button>
+
+              {/* Export CSV Master Button */}
+              <button
+                type="button"
+                id="btn-export-csv-products"
+                onClick={handleExportProductsCsv}
+                className="px-3 py-2 bg-white hover:bg-neutral-100 text-black border-2 border-black text-xs font-mono font-bold uppercase cursor-pointer flex items-center gap-1.5 shadow-xs transition-none"
+                title="Export active product catalog to CSV file"
+              >
+                <Download className="w-4 h-4 text-emerald-700" />
+                <span>Export CSV</span>
+              </button>
+
+              {/* Sync Drive Folder Button */}
+              <button
+                type="button"
+                id="btn-open-drive-sync-product"
+                onClick={() => {
+                  setCsvImportInitialMode('drive');
+                  setShowCsvImportModal(true);
+                }}
+                className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white border-2 border-black text-xs font-mono font-black uppercase cursor-pointer flex items-center gap-1.5 shadow-xs transition-none"
+                title="Sync and update products directly from your Google Drive folder"
+              >
+                <Cloud className="w-4 h-4 text-white" />
+                <span>Sync Drive Folder</span>
+              </button>
+
               <button
                 id="btn-open-add-product"
                 onClick={() => setShowAddModal(true)}
@@ -693,6 +954,121 @@ export function AdminView() {
               >
                 <Plus className="w-4 h-4 text-amber-400" />
                 Add Product
+              </button>
+            </div>
+          </div>
+
+          {/* Quick CSV Notification Toast */}
+          {csvQuickNotification && (
+            <div
+              id="banner-csv-quick-notification"
+              className="p-3 bg-emerald-50 border-2 border-emerald-700 text-emerald-950 flex items-center justify-between gap-2 text-xs font-mono font-bold"
+            >
+              <div className="flex items-center gap-2">
+                <FileSpreadsheet className="w-4 h-4 text-emerald-700" />
+                <span>{csvQuickNotification}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCsvQuickNotification(null)}
+                className="text-neutral-500 hover:text-black font-black cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          {/* Automated Google Drive Sync Result Banner */}
+          {driveSyncStatus && (
+            <div
+              id="banner-drive-sync-status"
+              className={`p-3 border-2 flex items-center justify-between gap-3 text-xs font-mono ${
+                driveSyncStatus.success 
+                  ? 'bg-emerald-50 border-emerald-700 text-emerald-950' 
+                  : 'bg-red-50 border-red-700 text-red-950'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <div className={`w-6 h-6 rounded-none flex items-center justify-center text-white flex-shrink-0 font-bold ${
+                  driveSyncStatus.success ? 'bg-emerald-600' : 'bg-red-600'
+                }`}>
+                  {driveSyncStatus.success ? <Check className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
+                </div>
+                <div>
+                  <div className="font-bold flex items-center gap-2">
+                    <span>{driveSyncStatus.message}</span>
+                    <span className="text-[10px] px-1.5 py-0.5 bg-black text-white font-mono uppercase">
+                      {driveSyncStatus.timestamp}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-neutral-600 mt-0.5">
+                    Source: <span className="font-bold text-neutral-800">{driveSyncStatus.source}</span>
+                    {' • '}Auto-sync triggered & parsed catalog data into state.
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                id="btn-dismiss-drive-sync-status"
+                onClick={clearDriveSyncStatus}
+                className="px-2 py-1 text-xs font-mono font-bold uppercase hover:bg-black/10 cursor-pointer"
+              >
+                Dismiss ✕
+              </button>
+            </div>
+          )}
+
+          {/* Linked Google Drive Folder Integration Banner */}
+          <div
+            id="banner-drive-folder-linked"
+            className="bg-blue-50 border-2 border-blue-900 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs font-mono"
+          >
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center font-bold flex-shrink-0">
+                <Cloud className="w-4 h-4" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-black text-blue-950 uppercase text-xs">
+                    Linked Google Drive Folder:
+                  </span>
+                  <span className="px-1.5 py-0.2 bg-blue-200 text-blue-900 text-[10px] font-bold uppercase border border-blue-400">
+                    Product Details Source
+                  </span>
+                  <span className="px-1.5 py-0.2 bg-emerald-100 text-emerald-800 text-[10px] font-bold uppercase border border-emerald-400 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse"></span>
+                    Auto-Sync Active (?sync=now)
+                  </span>
+                </div>
+                <p className="text-neutral-700 text-[11px] mt-0.5 truncate max-w-xl">
+                  Folder: <a href="https://drive.google.com/drive/folders/1K1WNrLSZcxW25eaHYP_skBC3g3lVAb5v" target="_blank" rel="noreferrer" className="underline font-bold text-blue-800 hover:text-blue-950">1K1WNrLSZcxW25eaHYP_skBC3g3lVAb5v</a>
+                  {lastDriveSyncTime && (
+                    <span className="ml-2 font-mono text-neutral-600">
+                      (Last synced: {new Date(lastDriveSyncTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})
+                    </span>
+                  )}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <a
+                href="https://drive.google.com/drive/folders/1K1WNrLSZcxW25eaHYP_skBC3g3lVAb5v"
+                target="_blank"
+                rel="noreferrer"
+                className="px-2.5 py-1.5 bg-white hover:bg-neutral-100 text-blue-900 text-[11px] font-bold uppercase border border-blue-300 flex items-center gap-1"
+              >
+                <ExternalLink className="w-3 h-3" />
+                Open Folder
+              </a>
+              <button
+                type="button"
+                id="btn-sync-drive-products-banner"
+                disabled={isDriveSyncing}
+                onClick={() => syncGoogleDriveCatalog()}
+                className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-[11px] font-black uppercase border border-black cursor-pointer disabled:cursor-not-allowed shadow-xs flex items-center gap-1.5"
+              >
+                <RefreshCw className={`w-3 h-3 ${isDriveSyncing ? 'animate-spin' : ''}`} />
+                <span>{isDriveSyncing ? 'Syncing...' : 'Sync Products Now'}</span>
               </button>
             </div>
           </div>
@@ -821,9 +1197,80 @@ export function AdminView() {
                             </span>
                           )}
                         </div>
-                        {product.focusNote && !isEditing && (
-                          <div className="text-[11px] font-mono text-amber-900 mt-0.5">
-                            ★ Note: {product.focusNote}
+                        {/* Daily Huddle Directive display & quick editor */}
+                        {!isEditing && (
+                          <div className="mt-1">
+                            {editingFocusNoteId === product.id ? (
+                              <div className="p-1.5 bg-amber-50 border-2 border-amber-600 space-y-1 text-left">
+                                <div className="text-[10px] font-mono font-black text-amber-900 uppercase flex items-center gap-1">
+                                  <Flame className="w-3 h-3 text-amber-600 fill-amber-500" />
+                                  <span>Daily Huddle Directive for Sales Reps:</span>
+                                </div>
+                                <input
+                                  id={`input-quick-huddle-directive-${product.id}`}
+                                  type="text"
+                                  value={inlineFocusNote}
+                                  onChange={(e) => setInlineFocusNote(e.target.value)}
+                                  placeholder="e.g. Clear 30 units before Friday - Extra 2% incentive"
+                                  className="w-full text-xs border border-black p-1 font-mono bg-white"
+                                  autoFocus
+                                />
+                                <div className="flex items-center gap-1 pt-0.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const trimmed = inlineFocusNote.trim();
+                                      updateProduct(product.id, {
+                                        focusNote: trimmed,
+                                        isFocusProduct: trimmed.length > 0 ? true : product.isFocusProduct,
+                                      });
+                                      setEditingFocusNoteId(null);
+                                    }}
+                                    className="px-2 py-0.5 bg-black hover:bg-neutral-800 text-white text-[10px] font-mono font-bold uppercase cursor-pointer"
+                                  >
+                                    Save Directive
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingFocusNoteId(null)}
+                                    className="px-2 py-0.5 bg-neutral-200 hover:bg-neutral-300 text-neutral-800 text-[10px] font-mono font-bold uppercase cursor-pointer"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            ) : product.focusNote ? (
+                              <div className="text-[11px] font-mono text-amber-950 bg-amber-50 border border-amber-300 px-1.5 py-0.5 flex items-center justify-between gap-1">
+                                <div className="flex items-center gap-1 truncate">
+                                  <Flame className="w-3 h-3 text-amber-600 fill-amber-500 flex-shrink-0" />
+                                  <span className="font-bold">Huddle:</span>
+                                  <span className="truncate">"{product.focusNote}"</span>
+                                </div>
+                                <button
+                                  type="button"
+                                  id={`btn-edit-directive-${product.id}`}
+                                  onClick={() => {
+                                    setEditingFocusNoteId(product.id);
+                                    setInlineFocusNote(product.focusNote || '');
+                                  }}
+                                  className="text-[10px] font-mono text-amber-900 hover:text-black font-bold underline cursor-pointer flex-shrink-0 ml-1"
+                                >
+                                  Edit
+                                </button>
+                              </div>
+                            ) : product.isFocusProduct ? (
+                              <button
+                                type="button"
+                                id={`btn-add-directive-${product.id}`}
+                                onClick={() => {
+                                  setEditingFocusNoteId(product.id);
+                                  setInlineFocusNote('');
+                                }}
+                                className="text-[10px] font-mono text-blue-700 hover:text-blue-950 underline cursor-pointer flex items-center gap-1"
+                              >
+                                <span>+ Add Daily Huddle Directive</span>
+                              </button>
+                            ) : null}
                           </div>
                         )}
                         <div className="text-[10px] font-mono text-neutral-500 mt-0.5">
@@ -1137,6 +1584,50 @@ export function AdminView() {
                 <Download className="w-3.5 h-3.5 text-white" />
                 <span>Export CSV Backup</span>
               </button>
+
+              {/* Sync to Google Drive */}
+              <button
+                type="button"
+                id="btn-sync-orders-gdrive"
+                onClick={() => setActiveTab('drive')}
+                className="px-3 py-1.5 bg-blue-700 hover:bg-blue-800 text-white font-mono font-black text-xs uppercase tracking-wider border-2 border-black flex items-center gap-1.5 cursor-pointer shadow-xs active:translate-y-0.5 transition-none"
+                title="Open Google Drive Cloud Hub to backup orders ledger to Drive"
+              >
+                <Cloud className="w-4 h-4 text-amber-300" />
+                <span>Sync to Google Drive</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Orders Export Notice / Status */}
+          {ordersExportNotice && (
+            <div className={`p-2.5 border-2 text-xs font-mono font-bold flex items-center gap-2 ${
+              ordersExportNotice.startsWith('✓') 
+                ? 'bg-emerald-50 border-emerald-600 text-emerald-900' 
+                : 'bg-amber-50 border-amber-600 text-amber-900'
+            }`}>
+              <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
+              <span>{ordersExportNotice}</span>
+            </div>
+          )}
+
+          {/* Dynamic UPI Checkout Info Ribbon */}
+          <div className="bg-amber-50 border-2 border-black p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 font-mono text-xs">
+            <div className="flex items-center gap-2.5">
+              <div className="w-7 h-7 bg-amber-400 text-black border border-black flex items-center justify-center font-black flex-shrink-0">
+                <QrCode className="w-4 h-4 text-black" />
+              </div>
+              <div>
+                <span className="font-black uppercase text-amber-950 block">
+                  Dynamic UPI Checkout & Counter QR Code:
+                </span>
+                <span className="text-[11px] text-neutral-700">
+                  Click <strong className="text-black bg-amber-200 px-1 border border-amber-400">UPI QR Pay</strong> on any invoice to display an instant, scannable QR code matching the exact bill total for walk-in retailers or depot counter customers.
+                </span>
+              </div>
+            </div>
+            <div className="text-[11px] font-bold text-neutral-600 flex-shrink-0">
+              UPI VPA: <span className="text-black font-black bg-white px-1.5 py-0.5 border border-black">{companyProfile.upiId || 'apexstockist@sbi'}</span>
             </div>
           </div>
 
@@ -1152,7 +1643,7 @@ export function AdminView() {
                   <th className="p-3 border-r border-neutral-700">Items Ordered</th>
                   <th className="p-3 border-r border-neutral-700 text-right w-28">Total (₹)</th>
                   <th className="p-3 border-r border-neutral-700 text-center w-28">Status</th>
-                  <th className="p-3 text-center w-48">Invoicing & Actions</th>
+                  <th className="p-3 text-center w-56">Invoicing & Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-black">
@@ -1275,19 +1766,35 @@ export function AdminView() {
                             >
                               {order.status}
                             </span>
-                            <span
-                              className={`px-1.5 py-0.2 text-[9px] font-mono uppercase border block ${
+                            <button
+                              type="button"
+                              id={`btn-order-payment-status-${order.id}`}
+                              onClick={() => setSelectedUpiOrder(order)}
+                              title="Click to present dynamic UPI QR Code"
+                              className={`w-full px-1.5 py-0.5 text-[9px] font-mono uppercase border block cursor-pointer transition-none ${
                                 order.paymentStatus === 'PAID'
-                                  ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                                  : 'bg-red-50 text-red-800 border-red-300'
+                                  ? 'bg-emerald-50 text-emerald-800 border-emerald-300 hover:bg-emerald-100'
+                                  : 'bg-amber-100 text-amber-900 border-amber-600 font-bold hover:bg-amber-200'
                               }`}
                             >
-                              {order.paymentStatus || 'UNPAID'}
-                            </span>
+                              {order.paymentStatus === 'PAID' ? '✓ PAID' : '⚡ SCAN UPI'}
+                            </button>
                           </td>
 
                           {/* Invoicing & Dispatch Actions */}
                           <td className="p-3 text-center space-y-1.5">
+                            {/* Dynamic UPI QR Code Button */}
+                            <button
+                              type="button"
+                              id={`btn-upi-qr-${order.id}`}
+                              onClick={() => setSelectedUpiOrder(order)}
+                              className="w-full px-2 py-1 bg-amber-400 hover:bg-amber-300 text-black border border-black text-[10px] font-black uppercase cursor-pointer flex items-center justify-center gap-1 shadow-xs tracking-tight"
+                              title="Generate dynamic UPI QR for customer checkout"
+                            >
+                              <QrCode className="w-3.5 h-3.5 text-black" />
+                              <span>UPI QR Pay</span>
+                            </button>
+
                             <div className="flex items-center justify-center gap-1">
                               <button
                                 id={`btn-view-invoice-${order.id}`}
@@ -1295,11 +1802,11 @@ export function AdminView() {
                                   setSelectedInvoiceOrder(order);
                                   setAutoPrintInvoice(false);
                                 }}
-                                className="px-2 py-1 bg-neutral-100 hover:bg-neutral-200 text-black border border-black text-[10px] font-bold uppercase cursor-pointer flex items-center gap-1 shadow-xs"
+                                className="flex-1 px-2 py-1 bg-neutral-100 hover:bg-neutral-200 text-black border border-black text-[10px] font-bold uppercase cursor-pointer flex items-center justify-center gap-1 shadow-xs"
                                 title="Open Bill & PDF Preview"
                               >
                                 <Eye className="w-3 h-3 text-blue-700" />
-                                <span>View Bill</span>
+                                <span>Bill</span>
                               </button>
 
                               <button
@@ -1308,7 +1815,7 @@ export function AdminView() {
                                   setSelectedInvoiceOrder(order);
                                   setAutoPrintInvoice(true);
                                 }}
-                                className="px-2 py-1 bg-black text-white hover:bg-neutral-800 border border-black text-[10px] font-bold uppercase cursor-pointer flex items-center gap-1 shadow-xs"
+                                className="flex-1 px-2 py-1 bg-black text-white hover:bg-neutral-800 border border-black text-[10px] font-bold uppercase cursor-pointer flex items-center justify-center gap-1 shadow-xs"
                                 title="Direct Print / Save PDF"
                               >
                                 <Printer className="w-3 h-3 text-amber-400" />
@@ -1692,24 +2199,66 @@ export function AdminView() {
               </p>
             </div>
 
-            {/* Category Filter */}
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-mono uppercase font-bold text-neutral-700">Category:</span>
-              <select
-                id="select-issue-category-filter"
-                value={issueCategoryFilter}
-                onChange={(e) => setIssueCategoryFilter(e.target.value)}
-                className="border-2 border-black px-2 py-1 font-mono text-xs bg-white"
-              >
-                <option value="ALL">All Categories</option>
-                <option value="Payment Dispute">Payment Dispute</option>
-                <option value="Damaged Goods">Damaged Goods</option>
-                <option value="Shop Closed">Shop Closed</option>
-                <option value="Stock Shortage">Stock Shortage</option>
-                <option value="Competitor Rate War">Competitor Rate War</option>
-              </select>
+            {/* Controls: Category Filter + External Audit Log Export */}
+            <div className="flex items-center gap-2.5 flex-wrap">
+              {/* Category Filter */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-mono uppercase font-bold text-neutral-700">Category:</span>
+                <select
+                  id="select-issue-category-filter"
+                  value={issueCategoryFilter}
+                  onChange={(e) => setIssueCategoryFilter(e.target.value)}
+                  className="border-2 border-black px-2 py-1 font-mono text-xs bg-white"
+                >
+                  <option value="ALL">All Categories</option>
+                  <option value="Payment Dispute">Payment Dispute</option>
+                  <option value="Damaged Goods">Damaged Goods</option>
+                  <option value="Shop Closed">Shop Closed</option>
+                  <option value="Stock Shortage">Stock Shortage</option>
+                  <option value="Competitor Rate War">Competitor Rate War</option>
+                </select>
+              </div>
+
+              {/* Dedicated External Audit Export Buttons (CSV & JSON) */}
+              <div className="flex items-center gap-1 bg-neutral-100 p-1 border-2 border-black">
+                <span className="text-[10px] font-mono font-bold uppercase text-neutral-600 px-1 hidden lg:inline">
+                  External Audit:
+                </span>
+                <button
+                  type="button"
+                  id="btn-download-issues-csv"
+                  onClick={() => handleExportIssues('csv')}
+                  className="px-2.5 py-1 bg-black hover:bg-neutral-800 text-white font-mono text-xs font-black uppercase flex items-center gap-1.5 cursor-pointer shadow-xs active:translate-y-0.5 transition-none"
+                  title="Download all ticket logs as a formatted CSV file for external audit"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-amber-300" />
+                  <span>Download CSV Audit</span>
+                </button>
+                <button
+                  type="button"
+                  id="btn-download-issues-json"
+                  onClick={() => handleExportIssues('json')}
+                  className="px-2.5 py-1 bg-white hover:bg-neutral-200 text-neutral-900 border border-black font-mono text-xs font-black uppercase flex items-center gap-1.5 cursor-pointer shadow-xs active:translate-y-0.5 transition-none"
+                  title="Download all ticket logs as a formatted JSON file for external audit"
+                >
+                  <Download className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Download JSON Audit</span>
+                </button>
+              </div>
             </div>
           </div>
+
+          {/* Field Tickets Audit Export Notification Banner */}
+          {issuesExportNotice && (
+            <div className={`p-2.5 border-2 text-xs font-mono font-bold flex items-center gap-2 ${
+              issuesExportNotice.startsWith('✓') 
+                ? 'bg-emerald-50 border-emerald-600 text-emerald-900' 
+                : 'bg-amber-50 border-amber-600 text-amber-900'
+            }`}>
+              <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
+              <span>{issuesExportNotice}</span>
+            </div>
+          )}
 
           {/* Table of Field Tickets */}
           <div className="border-2 border-black bg-white overflow-x-auto">
@@ -2186,6 +2735,36 @@ export function AdminView() {
       )}
 
       {/* ========================================================================= */}
+      {/* TAB 7: GOOGLE DRIVE CLOUD HUB & BACKUPS                                   */}
+      {/* ========================================================================= */}
+      {activeTab === 'drive' && (
+        <div id="admin-panel-drive" className="space-y-4">
+          <GoogleDrivePanel />
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* CSV & GOOGLE DRIVE PRODUCT IMPORT MODAL                                   */}
+      {/* ========================================================================= */}
+      {showCsvImportModal && (
+        <CsvProductImportModal
+          initialMode={csvImportInitialMode}
+          onClose={() => setShowCsvImportModal(false)}
+          onSuccess={() => setShowCsvImportModal(false)}
+        />
+      )}
+
+      {/* ========================================================================= */}
+      {/* GOOGLE DRIVE PRODUCT DETAILS SYNC MODAL                                   */}
+      {/* ========================================================================= */}
+      {showDriveSyncModal && (
+        <GoogleDriveProductSyncModal
+          onClose={() => setShowDriveSyncModal(false)}
+          onSuccess={() => setShowDriveSyncModal(false)}
+        />
+      )}
+
+      {/* ========================================================================= */}
       {/* ADD PRODUCT MODAL                                                         */}
       {/* ========================================================================= */}
       {showAddModal && (
@@ -2547,6 +3126,24 @@ export function AdminView() {
           isOpen={true}
           onClose={() => setSelectedInvoiceOrder(null)}
           autoPrint={autoPrintInvoice}
+        />
+      )}
+
+      {/* Dynamic UPI Checkout Modal for Counter / Store Owner Display */}
+      {selectedUpiOrder && (
+        <UpiCheckoutModal
+          order={selectedUpiOrder}
+          companyProfile={companyProfile}
+          onClose={() => setSelectedUpiOrder(null)}
+          onMarkPaid={(orderId) => {
+            updateOrderPaymentStatus(orderId, 'PAID');
+            setSelectedUpiOrder((prev) => (prev ? { ...prev, paymentStatus: 'PAID' } : null));
+          }}
+          onOpenInvoice={(order) => {
+            setSelectedUpiOrder(null);
+            setSelectedInvoiceOrder(order);
+            setAutoPrintInvoice(false);
+          }}
         />
       )}
     </div>

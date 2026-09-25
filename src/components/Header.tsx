@@ -1,11 +1,14 @@
+import { useState } from 'react';
 import { useApp } from '../context/AppContext.tsx';
-import { Building2, Briefcase, LogOut, UserCheck, ShoppingBag } from 'lucide-react';
+import { Building2, Briefcase, LogOut, UserCheck, ShoppingBag, Cloud } from 'lucide-react';
 import { HeaderMetricsBar } from './HeaderMetricsBar.tsx';
 import { OfflineSyncBadge } from './OfflineSyncBadge.tsx';
 import { PWAInstallButton } from './PWAInstallButton.tsx';
+import { GoogleDriveHubModal } from './GoogleDriveHubModal.tsx';
 
 export function Header() {
   const { currentUser, logout, salesman, setCurrentRoute } = useApp();
+  const [showDriveModal, setShowDriveModal] = useState(false);
 
   const isAdmin = currentUser?.role === 'ADMIN';
 
@@ -20,6 +23,16 @@ export function Header() {
           <span className="text-neutral-300 hidden sm:inline">AUTHENTICATED ROLE ISOLATION</span>
         </div>
         <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+          <button
+            type="button"
+            id="btn-header-open-drive-top"
+            onClick={() => setShowDriveModal(true)}
+            className="flex items-center gap-1 px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-amber-300 border border-neutral-600 text-[11px] font-bold uppercase cursor-pointer"
+            title="Open Google Drive Cloud Center"
+          >
+            <Cloud className="w-3.5 h-3.5 text-amber-400" />
+            <span>Google Drive</span>
+          </button>
           <PWAInstallButton variant="header" />
           <OfflineSyncBadge />
         </div>
@@ -89,6 +102,12 @@ export function Header() {
 
       {/* Quick Header Metrics Bar (Only for Admin, or tailored for Salesman) */}
       <HeaderMetricsBar />
+
+      {/* Google Drive Hub Modal */}
+      <GoogleDriveHubModal 
+        isOpen={showDriveModal} 
+        onClose={() => setShowDriveModal(false)} 
+      />
     </header>
   );
 }

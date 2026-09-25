@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { Order } from '../types.ts';
 import { InvoiceModal } from '../components/InvoiceModal.tsx';
+import { DailyHuddleDashboard } from '../components/DailyHuddleDashboard.tsx';
 import { 
   Target, 
   IndianRupee, 
@@ -19,7 +20,9 @@ import {
   Flame,
   FileText,
   Printer,
-  Eye
+  Eye,
+  Zap,
+  ListTodo
 } from 'lucide-react';
 
 export function SalesmanView() {
@@ -122,6 +125,17 @@ export function SalesmanView() {
     }
     const validated = Math.min(prod.stock, val);
     setOrderQuantities((prev) => ({ ...prev, [productId]: validated }));
+  };
+
+  // Helper: Quick Add focus product units from Daily Huddle
+  const handleQuickAddFocusProduct = (productId: string, quantity: number) => {
+    const prod = products.find((p) => p.id === productId);
+    if (!prod) return;
+    setOrderQuantities((prev) => {
+      const current = prev[productId] || 0;
+      const next = Math.min(prod.stock, current + quantity);
+      return { ...prev, [productId]: next };
+    });
   };
 
   // 3. Wholesale Order Booking Handler
@@ -299,50 +313,16 @@ export function SalesmanView() {
       )}
 
       {/* ========================================================================= */}
-      {/* 1. FOCUS PRODUCTS ALERT (TOP BANNER)                                      */}
+      {/* 1. DAILY HUDDLE DASHBOARD (SYNCED FROM ADMIN FOCUS NOTES)                  */}
       {/* ========================================================================= */}
-      {focusProducts.length > 0 && (
-        <div id="salesman-focus-alert-box" className="border-2 border-amber-600 bg-amber-50 p-3 space-y-2">
-          <div className="flex items-center justify-between border-b border-amber-300 pb-1.5">
-            <span className="inline-flex items-center gap-1.5 bg-black text-amber-400 border border-black px-2 py-0.5 text-[11px] font-mono font-black uppercase tracking-wider">
-              <Flame className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
-              ADMIN FOCUS ITEM
-            </span>
-            <span className="text-[10px] font-mono font-bold text-amber-900 uppercase">
-              {focusProducts.length} Priority SKU{focusProducts.length > 1 ? 's' : ''}
-            </span>
-          </div>
-
-          <div className="space-y-2 pt-0.5">
-            {focusProducts.map((p) => (
-              <div
-                key={p.id}
-                id={`focus-alert-item-${p.id}`}
-                className="bg-white border-2 border-black p-2.5 space-y-1"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <span className="text-[10px] font-mono font-bold bg-neutral-900 text-white px-1 py-0.2 mr-1.5">
-                      {p.sku}
-                    </span>
-                    <strong className="text-xs font-black text-neutral-950">{p.name}</strong>
-                  </div>
-                  <div className="text-right flex-shrink-0 font-mono">
-                    <span className="text-[10px] text-neutral-500 block uppercase">Wholesale</span>
-                    <span className="text-xs font-black text-emerald-800">₹{p.wholesalePrice}</span>
-                  </div>
-                </div>
-
-                {p.focusNote && (
-                  <div className="p-1.5 bg-amber-100/90 border border-amber-400 text-amber-950 font-mono text-[11px] leading-tight">
-                    <span className="font-black uppercase text-amber-900">Admin Directive:</span> {p.focusNote}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      <DailyHuddleDashboard
+        salesman={salesman}
+        products={products}
+        orders={orders}
+        onQuickAddProduct={handleQuickAddFocusProduct}
+        onOpenCollectionModal={() => setShowCollectionModal(true)}
+        onOpenIssueModal={() => setShowIssueModal(true)}
+      />
 
       {/* ========================================================================= */}
       {/* 2. DAILY TARGET PROGRESS CARD                                             */}
@@ -575,6 +555,11 @@ export function SalesmanView() {
                           <span className="inline-block text-[10px] font-mono font-bold text-amber-900 bg-amber-200 px-1">
                             ★ Focus SKU
                           </span>
+                        )}
+                        {product.focusNote && (
+                          <div className="text-[10px] font-mono font-bold text-amber-950 bg-amber-100 border border-amber-300 px-1.5 py-0.2 mt-0.5 block">
+                            ⚡ Directive: {product.focusNote}
+                          </div>
                         )}
                         {product.wholesaleScheme && (
                           <div className="text-[10px] font-mono font-bold text-amber-950 bg-amber-100 border border-amber-300 px-1.5 py-0.2 mt-0.5 inline-block">

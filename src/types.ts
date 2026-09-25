@@ -100,6 +100,7 @@ export type RoleRoute = '/admin' | '/salesman' | '/store';
 export type SyncActionType = 
   | 'CREATE_ORDER' 
   | 'UPDATE_ORDER_STATUS' 
+  | 'UPDATE_ORDER_PAYMENT'
   | 'UPDATE_STOCK' 
   | 'RECORD_COLLECTION' 
   | 'ADD_ISSUE' 
@@ -122,5 +123,23 @@ export interface SyncLedgerSummary {
   pendingCount: number;
   isSyncing: boolean;
   offlineMode: boolean;
+}
+
+export interface DriveSyncResult {
+  success: boolean;
+  count: number;
+  added?: number;
+  updated?: number;
+  message: string;
+  source: string;
+  timestamp: string;
+}
+
+export interface SyncDriveCatalogOptions {
+  mode?: 'merge' | 'replace';
+  folderId?: string;
+  forcePreset?: boolean;
+  silent?: boolean;
+  source?: string;
 }
 

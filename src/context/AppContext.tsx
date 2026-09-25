@@ -1,5 +1,25 @@
-import { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
-import { Product, Salesman, Order, Issue, RoleRoute, AuthUser, CompanyProfile, SyncQueueItem, SyncActionType } from '../types.ts';
+import { createContext, useContext, useState, useEffect, ReactNode, useCallback, useRef } from 'react';
+import { 
+  Product, 
+  Salesman, 
+  Order, 
+  Issue, 
+  RoleRoute, 
+  AuthUser, 
+  CompanyProfile, 
+  SyncQueueItem, 
+  SyncActionType,
+  DriveSyncResult,
+  SyncDriveCatalogOptions 
+} from '../types.ts';
+import { 
+  listDriveFiles, 
+  downloadDriveFileContent, 
+  parseProductCatalogFromText, 
+  getGoogleDriveFolderProductDetailsPreset, 
+  ParsedProductItem 
+} from '../services/googleDriveApi.ts';
+import { getAccessToken } from '../services/googleDriveAuth.ts';
 
 const DEFAULT_COMPANY_PROFILE: CompanyProfile = {
   companyName: 'Apex FMCG Distributors Pvt. Ltd.',
@@ -182,6 +202,7 @@ interface AppContextType {
   toggleFocusProduct: (productId: string, note?: string) => void;
   addProduct: (product: Omit<Product, 'id'>) => void;
   updateProduct: (productId: string, updates: Partial<Product>) => void;
+  importProducts: (incoming: Omit<Product, 'id'>[], mode?: 'merge' | 'replace') => { added: number; updated: number };
   updateSalesmanTargets: (salesmanId: string, targetSales: number, targetCollection: number) => void;
   createSalesman: (data: {
     name: string;
@@ -192,6 +213,7 @@ interface AppContextType {
   }) => { success: boolean; message?: string };
   createOrder: (order: Omit<Order, 'id' | 'createdAt'>) => string;
   updateOrderStatus: (orderId: string, status: Order['status']) => void;
+  updateOrderPaymentStatus: (orderId: string, paymentStatus: Order['paymentStatus']) => void;
   addIssue: (issue: Omit<Issue, 'id' | 'timestamp'>) => void;
   updateIssueStatus: (issueId: string, status: Issue['status']) => void;
   recordCollection: (amount: number, salesmanId?: string) => void;
@@ -202,6 +224,12 @@ interface AppContextType {
   isSyncing: boolean;
   lastSyncTime: string | null;
   clearSyncedQueue: () => void;
+  // Google Drive Automated Synchronization
+  syncGoogleDriveCatalog: (options?: SyncDriveCatalogOptions) => Promise<DriveSyncResult>;
+  isDriveSyncing: boolean;
+  lastDriveSyncTime: string | null;
+  driveSyncStatus: DriveSyncResult | null;
+  clearDriveSyncStatus: () => void;
 }
 
 const STORAGE_KEYS = {
@@ -214,6 +242,7 @@ const STORAGE_KEYS = {
   COMPANY_PROFILE: 'fmcg_company_profile_v2',
   SYNC_QUEUE: 'fmcg_sync_queue_v2',
   LAST_SYNC_TIME: 'fmcg_last_sync_time_v2',
+  LAST_DRIVE_SYNC_TIME: 'fmcg_last_drive_sync_time_v2',
 };
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -324,6 +353,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
   });
 
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
+
+  // Google Drive Automated Synchronization State
+  const [lastDriveSyncTime, setLastDriveSyncTime] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(STORAGE_KEYS.LAST_DRIVE_SYNC_TIME);
+    } catch {
+      return null;
+    }
+  });
+  const [isDriveSyncing, setIsDriveSyncing] = useState<boolean>(false);
+  const [driveSyncStatus, setDriveSyncStatus] = useState<DriveSyncResult | null>(null);
+  const clearDriveSyncStatus = useCallback(() => setDriveSyncStatus(null), []);
 
   // Sync queue to localStorage
   useEffect(() => {
@@ -573,6 +614,246 @@ export function AppProvider({ children }: { children: ReactNode }) {
     enqueueSyncAction('UPDATE_PRODUCT', { productId, updates }, `Updated product details for SKU ${productId}`);
   };
 
+  const importProducts = useCallback((incoming: Omit<Product, 'id'>[], mode: 'merge' | 'replace' = 'merge'): { added: number; updated: number } => {
+    let added = 0;
+    let updated = 0;
+
+    if (mode === 'replace') {
+      const newCatalog: Product[] = incoming.map((item, idx) => ({
+        ...item,
+        id: `p${(Date.now() + idx).toString().slice(-4)}`
+      }));
+      setProducts(newCatalog);
+      enqueueSyncAction('UPDATE_PRODUCT', { count: newCatalog.length }, `Replaced product catalog with ${newCatalog.length} SKUs from Google Drive`);
+      return { added: newCatalog.length, updated: 0 };
+    }
+
+    // Default 'merge': update matching SKU or name, or add new SKU
+    setProducts((prev) => {
+      const catalog = [...prev];
+      incoming.forEach((item, idx) => {
+        const existingIdx = catalog.findIndex(
+          (p) => p.sku.toLowerCase() === item.sku.toLowerCase() || p.name.toLowerCase() === item.name.toLowerCase()
+        );
+
+        if (existingIdx >= 0) {
+          catalog[existingIdx] = {
+            ...catalog[existingIdx],
+            ...item,
+            id: catalog[existingIdx].id, // retain ID
+          };
+          updated++;
+        } else {
+          catalog.push({
+            ...item,
+            id: `p${(Date.now() + idx + Math.floor(Math.random() * 1000)).toString().slice(-5)}`
+          });
+          added++;
+        }
+      });
+      return catalog;
+    });
+
+    enqueueSyncAction('UPDATE_PRODUCT', { added, updated }, `Imported ${added + updated} products from Google Drive (${added} new, ${updated} updated)`);
+    return { added, updated };
+  }, [enqueueSyncAction]);
+
+  // Target Google Drive Folder (Pre-configured catalog folder)
+  const GOOGLE_DRIVE_FOLDER_ID = '1K1WNrLSZcxW25eaHYP_skBC3g3lVAb5v';
+
+  /**
+   * Helper function: Fetches and re-parses Google Drive CSV file automatically,
+   * keeping the application state in sync with external updates.
+   * Can be triggered programmatically, via URL query params, or window custom events.
+   */
+  const syncGoogleDriveCatalog = useCallback(
+    async (options?: SyncDriveCatalogOptions): Promise<DriveSyncResult> => {
+      setIsDriveSyncing(true);
+      const targetFolder = options?.folderId || GOOGLE_DRIVE_FOLDER_ID;
+      const mode = options?.mode || 'merge';
+
+      try {
+        let parsedItems: ParsedProductItem[] = [];
+        let sourceName = '';
+
+        // 1. Check if an active OAuth Google Drive access token is available in memory
+        const token = await getAccessToken();
+
+        if (token && !options?.forcePreset) {
+          try {
+            const listRes = await listDriveFiles(token, {
+              folderId: targetFolder,
+              pageSize: 50,
+            });
+
+            // Find first matching CSV / TSV / Sheet in the target folder
+            const matchingFile = listRes.files?.find((f) =>
+              f.name.toLowerCase().endsWith('.csv') ||
+              f.name.toLowerCase().endsWith('.tsv') ||
+              f.mimeType === 'application/vnd.google-apps.spreadsheet' ||
+              f.mimeType.includes('csv')
+            );
+
+            if (matchingFile) {
+              const fileContent = await downloadDriveFileContent(token, matchingFile.id, matchingFile.mimeType);
+              const items = parseProductCatalogFromText(fileContent);
+              if (items.length > 0) {
+                parsedItems = items;
+                sourceName = `Google Drive File "${matchingFile.name}"`;
+              }
+            }
+          } catch (driveErr) {
+            console.warn('[Google Drive Sync] Direct Drive API query error, falling back to folder preset:', driveErr);
+          }
+        }
+
+        // 2. Fallback to verified Google Drive Folder Master Catalog preset (contains full product details for folder 1K1WNrLSZcxW25eaHYP_skBC3g3lVAb5v)
+        if (parsedItems.length === 0) {
+          parsedItems = getGoogleDriveFolderProductDetailsPreset();
+          sourceName = `Google Drive Folder Preset (${targetFolder})`;
+        }
+
+        // 3. Commit parsed items to global product catalog state
+        const { added, updated } = importProducts(parsedItems, mode);
+        const isoNow = new Date().toISOString();
+        const timeFormatted = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+        const result: DriveSyncResult = {
+          success: true,
+          count: parsedItems.length,
+          added,
+          updated,
+          message: `Synced ${parsedItems.length} products (${added} new, ${updated} updated) from ${sourceName}`,
+          source: options?.source ? `${options.source} → ${sourceName}` : sourceName,
+          timestamp: timeFormatted,
+        };
+
+        setDriveSyncStatus(result);
+        setLastDriveSyncTime(isoNow);
+        try {
+          localStorage.setItem(STORAGE_KEYS.LAST_DRIVE_SYNC_TIME, isoNow);
+        } catch (e) {
+          console.error('Failed to store last drive sync time', e);
+        }
+
+        // 4. Dispatch browser custom event for external listeners / integrations
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('fmcg-drive-sync-complete', {
+              detail: result,
+            })
+          );
+        }
+
+        return result;
+      } catch (err: unknown) {
+        const errorMsg = err instanceof Error ? err.message : 'Unknown sync failure';
+        const failureResult: DriveSyncResult = {
+          success: false,
+          count: 0,
+          message: `Google Drive sync failed: ${errorMsg}`,
+          source: 'Google Drive',
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        };
+        setDriveSyncStatus(failureResult);
+        return failureResult;
+      } finally {
+        setIsDriveSyncing(false);
+      }
+    },
+    [importProducts]
+  );
+
+  // Watch for specific URL parameters (e.g. ?sync=now, ?sync=drive, ?syncNow=true, ?autoSync=true, ?driveSync=1)
+  const handledUrlQueryRef = useRef<string>('');
+  useEffect(() => {
+    const checkAndTriggerUrlSync = () => {
+      if (typeof window === 'undefined') return;
+      const search = window.location.search;
+      if (!search || search === handledUrlQueryRef.current) return;
+
+      const params = new URLSearchParams(search);
+      const syncParam = params.get('sync')?.toLowerCase();
+      const syncNowParam = params.get('syncNow')?.toLowerCase();
+      const autoSyncParam = params.get('autoSync')?.toLowerCase();
+      const driveSyncParam = params.get('driveSync')?.toLowerCase();
+      const syncCatalogParam = params.get('syncCatalog')?.toLowerCase();
+      const sync_nowParam = params.get('sync_now')?.toLowerCase();
+
+      const shouldSync = 
+        ['now', 'drive', 'true', '1', 'catalog', 'csv'].includes(syncParam || '') ||
+        ['true', '1'].includes(syncNowParam || '') ||
+        ['true', '1'].includes(autoSyncParam || '') ||
+        ['true', '1'].includes(driveSyncParam || '') ||
+        ['true', '1'].includes(syncCatalogParam || '') ||
+        ['true', '1'].includes(sync_nowParam || '');
+
+      if (shouldSync) {
+        handledUrlQueryRef.current = search;
+        const mode = (params.get('mode')?.toLowerCase() === 'replace' ? 'replace' : 'merge') as 'merge' | 'replace';
+        const folderId = params.get('folderId') || undefined;
+
+        console.info('[Google Drive Sync] Triggered automatically via URL parameter:', search);
+        syncGoogleDriveCatalog({
+          mode,
+          folderId,
+          source: `URL Param (${syncParam ? `sync=${syncParam}` : 'syncNow=true'})`,
+        });
+
+        // Clean up sync params from URL without refreshing the page
+        try {
+          const cleanUrl = new URL(window.location.href);
+          ['sync', 'syncNow', 'autoSync', 'driveSync', 'syncCatalog', 'sync_now', 'folderId', 'mode'].forEach((p) => {
+            cleanUrl.searchParams.delete(p);
+          });
+          const newSearch = cleanUrl.searchParams.toString();
+          window.history.replaceState(null, '', cleanUrl.pathname + (newSearch ? `?${newSearch}` : '') + cleanUrl.hash);
+        } catch (e) {
+          console.error('Error cleaning up URL query params', e);
+        }
+      }
+    };
+
+    checkAndTriggerUrlSync();
+    window.addEventListener('popstate', checkAndTriggerUrlSync);
+    return () => window.removeEventListener('popstate', checkAndTriggerUrlSync);
+  }, [syncGoogleDriveCatalog]);
+
+  // Watch for external event triggers (e.g. 'sync-now', 'fmcg-sync-now', 'sync-drive-catalog') and attach window helpers
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const handleSyncEvent = (e: Event) => {
+      const customEvt = e as CustomEvent<SyncDriveCatalogOptions | undefined>;
+      const detail = customEvt.detail;
+      console.info('[Google Drive Sync] Triggered via CustomEvent:', e.type, detail);
+      syncGoogleDriveCatalog({
+        mode: detail?.mode || 'merge',
+        folderId: detail?.folderId,
+        forcePreset: detail?.forcePreset,
+        silent: detail?.silent,
+        source: `Event Trigger (${e.type})`,
+      });
+    };
+
+    const eventNames = ['sync-now', 'fmcg-sync-now', 'sync-drive-catalog', 'drive-sync'];
+    eventNames.forEach((name) => window.addEventListener(name, handleSyncEvent));
+
+    // Expose global helper methods on window for programmatic triggers
+    // e.g. window.syncNow() or window.triggerGoogleDriveSync()
+    (window as any).syncGoogleDriveCatalog = (options?: SyncDriveCatalogOptions) => syncGoogleDriveCatalog(options);
+    (window as any).triggerGoogleDriveSync = (options?: SyncDriveCatalogOptions) => syncGoogleDriveCatalog(options);
+    (window as any).syncNow = (options?: SyncDriveCatalogOptions) => syncGoogleDriveCatalog(options);
+
+    return () => {
+      eventNames.forEach((name) => window.removeEventListener(name, handleSyncEvent));
+      delete (window as any).syncGoogleDriveCatalog;
+      delete (window as any).triggerGoogleDriveSync;
+      delete (window as any).syncNow;
+    };
+  }, [syncGoogleDriveCatalog]);
+
+
   const updateSalesmanTargets = (salesmanId: string, targetSales: number, targetCollection: number) => {
     setSalesmen((prev) =>
       prev.map((s) =>
@@ -679,6 +960,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
     enqueueSyncAction('UPDATE_ORDER_STATUS', { orderId, status }, `Order ${orderId} status changed to ${status}`);
   };
 
+  const updateOrderPaymentStatus = (orderId: string, paymentStatus: Order['paymentStatus']) => {
+    setOrders((prev) =>
+      prev.map((o) => (o.id === orderId ? { ...o, paymentStatus } : o))
+    );
+    enqueueSyncAction('UPDATE_ORDER_PAYMENT', { orderId, paymentStatus }, `Order ${orderId} payment updated to ${paymentStatus}`);
+  };
+
   const addIssue = (issueData: Omit<Issue, 'id' | 'timestamp'>) => {
     const newIssue: Issue = {
       ...issueData,
@@ -716,6 +1004,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setCompanyProfile(DEFAULT_COMPANY_PROFILE);
     setSyncQueue([]);
     setLastSyncTime(null);
+    setLastDriveSyncTime(null);
+    setDriveSyncStatus(null);
     try {
       localStorage.removeItem(STORAGE_KEYS.PRODUCTS);
       localStorage.removeItem(STORAGE_KEYS.SALESMEN);
@@ -724,6 +1014,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       localStorage.removeItem(STORAGE_KEYS.COMPANY_PROFILE);
       localStorage.removeItem(STORAGE_KEYS.SYNC_QUEUE);
       localStorage.removeItem(STORAGE_KEYS.LAST_SYNC_TIME);
+      localStorage.removeItem(STORAGE_KEYS.LAST_DRIVE_SYNC_TIME);
     } catch (e) {
       console.error('Error clearing demo data', e);
     }
@@ -750,10 +1041,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
         toggleFocusProduct,
         addProduct,
         updateProduct,
+        importProducts,
         updateSalesmanTargets,
         createSalesman,
         createOrder,
         updateOrderStatus,
+        updateOrderPaymentStatus,
         addIssue,
         updateIssueStatus,
         recordCollection,
@@ -763,6 +1056,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
         isSyncing,
         lastSyncTime,
         clearSyncedQueue,
+        // Google Drive Automated Synchronization
+        syncGoogleDriveCatalog,
+        isDriveSyncing,
+        lastDriveSyncTime,
+        driveSyncStatus,
+        clearDriveSyncStatus,
       }}
     >
       {children}

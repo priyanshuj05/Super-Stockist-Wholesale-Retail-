@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import { Order, InvoiceTemplateId, InvoiceAccentColor } from '../types.ts';
 import { useApp } from '../context/AppContext.tsx';
 import { 
@@ -15,8 +16,11 @@ import {
   CheckCircle2, 
   ShieldCheck, 
   Copy,
-  ExternalLink
+  ExternalLink,
+  Cloud
 } from 'lucide-react';
+import { getAccessToken, googleSignIn } from '../services/googleDriveAuth.ts';
+import { findOrCreateFolder, uploadDriveFile } from '../services/googleDriveApi.ts';
 
 interface InvoiceModalProps {
   order: Order | null;
@@ -37,6 +41,8 @@ export function InvoiceModal({ order, isOpen = true, onClose, autoPrint = false 
   const [accent, setAccent] = useState<InvoiceAccentColor>('slate');
 
   const [copiedNotification, setCopiedNotification] = useState(false);
+  const [isSavingToDrive, setIsSavingToDrive] = useState(false);
+  const [driveSaveStatus, setDriveSaveStatus] = useState<{ success: boolean; msg: string; link?: string } | null>(null);
 
   // Sync template when order changes
   useEffect(() => {
@@ -106,6 +112,13 @@ export function InvoiceModal({ order, isOpen = true, onClose, autoPrint = false 
   const items = order.items || [];
   const rawSubtotal = items.reduce((sum, it) => sum + (it.unitPrice * it.quantity), 0);
   
+  // Standard NPCI dynamic UPI payload for invoice total
+  const payeeVpa = companyProfile.upiId || 'apexstockist@sbi';
+  const payeeName = companyProfile.companyName || 'Apex FMCG Distributors';
+  const amountStr = order.totalAmount.toFixed(2);
+  const transactionNote = `Bill ${invoiceNum} ${order.storeName || ''}`.trim().slice(0, 50);
+  const upiPayload = `upi://pay?pa=${encodeURIComponent(payeeVpa)}&pn=${encodeURIComponent(payeeName)}&am=${amountStr}&cu=INR&tn=${encodeURIComponent(transactionNote)}`;
+  
   // Tax calculations for GST: assumed GST 5% on foods or 18% on chemicals, split 50/50 CGST & SGST
   // For standard B2B FMCG invoice presentation:
   const gstRate = 5; // standard 5% on essential FMCG / edible oils / grains
@@ -152,6 +165,97 @@ UPI: ${companyProfile.upiId}`;
     navigator.clipboard.writeText(summary);
     setCopiedNotification(true);
     setTimeout(() => setCopiedNotification(false), 3000);
+  };
+
+  const handleSaveToGoogleDrive = async () => {
+    setIsSavingToDrive(true);
+    setDriveSaveStatus(null);
+    try {
+      let token = await getAccessToken();
+      if (!token) {
+        // Trigger Google Sign In
+        const authRes = await googleSignIn();
+        token = authRes?.accessToken || null;
+      }
+
+      if (!token) {
+        throw new Error('Google Drive authentication required.');
+      }
+
+      // Ensure FMCG Invoices folder in Drive
+      const folder = await findOrCreateFolder(token, 'FMCG Distro Invoices');
+
+      // Generate Invoice Text / Summary format
+      const invoiceFormattedText = `========================================================================
+TAX INVOICE / BILL OF SUPPLY: ${invoiceNum}
+========================================================================
+Company: ${companyProfile.companyName}
+Address: ${companyProfile.businessAddress}
+GSTIN: ${companyProfile.gstin} | Contact: ${companyProfile.contactNumber} | Email: ${companyProfile.email}
+Bank: ${companyProfile.bankName} | A/C: ${companyProfile.accountNumber} | IFSC: ${companyProfile.ifscCode}
+UPI ID: ${companyProfile.upiId}
+
+------------------------------------------------------------------------
+CUSTOMER / RECIPIENT DETAILS:
+------------------------------------------------------------------------
+Name: ${order.storeName || order.customerName || 'N/A'}
+Contact: ${order.customerMobile || 'N/A'}
+GSTIN: ${order.retailerGstin || 'Unregistered'}
+Address: ${order.deliveryAddress || 'Depot Delivery'}
+Order Type: ${isWholesale ? 'B2B Wholesale' : 'Direct Retail'}
+Date & Time: ${order.createdAt}
+Sales Representative: ${order.salesmanName || 'Direct Counter'}
+
+------------------------------------------------------------------------
+PARTICULARS & LINE ITEMS:
+------------------------------------------------------------------------
+${order.items.map((item, idx) => `${idx + 1}. ${item.productName} (HSN: ${item.hsn || '2106'})
+   Qty: ${item.quantity} x Rs.${item.unitPrice.toFixed(2)} = Rs.${item.total.toFixed(2)}${item.wholesaleScheme ? ` [Scheme: ${item.wholesaleScheme}]` : ''}`).join('\n')}
+
+------------------------------------------------------------------------
+TAX BREAKDOWN & TOTALS:
+------------------------------------------------------------------------
+Taxable Amount: Rs.${taxableValue.toFixed(2)}
+CGST (${gstRate / 2}%): Rs.${cgstAmount.toFixed(2)}
+SGST (${gstRate / 2}%): Rs.${sgstAmount.toFixed(2)}
+TOTAL INVOICE VALUE: Rs.${order.totalAmount.toFixed(2)}
+Amount in Words: ${convertNumberToWords(order.totalAmount)}
+Payment Status: ${order.paymentStatus}
+Order Status: ${order.status}
+
+------------------------------------------------------------------------
+TERMS & CONDITIONS:
+------------------------------------------------------------------------
+${companyProfile.termsAndConditions || 'Goods once sold will not be returned without authorized dispute claim.'}
+========================================================================
+Generated by FMCG Distro OS
+`;
+
+      const safeCustomerName = (order.storeName || 'Customer').replace(/[^a-zA-Z0-9]/g, '_');
+      const filename = `INVOICE_${invoiceNum}_${safeCustomerName}.txt`;
+
+      const uploaded = await uploadDriveFile(token, {
+        name: filename,
+        mimeType: 'text/plain',
+        content: invoiceFormattedText,
+        parentFolderId: folder.id,
+        description: `Invoice ${invoiceNum} for ${order.storeName} saved from FMCG Distro OS.`
+      });
+
+      setDriveSaveStatus({
+        success: true,
+        msg: `Saved to Google Drive!`,
+        link: uploaded.webViewLink
+      });
+    } catch (err: unknown) {
+      console.error('Failed to save invoice to Drive:', err);
+      setDriveSaveStatus({
+        success: false,
+        msg: err instanceof Error ? err.message : 'Could not save invoice to Google Drive'
+      });
+    } finally {
+      setIsSavingToDrive(false);
+    }
   };
 
   return (
@@ -328,6 +432,19 @@ UPI: ${companyProfile.upiId}`;
                 <Copy className="w-4 h-4" />
               </button>
 
+              {/* Save directly to Google Drive */}
+              <button
+                type="button"
+                id="btn-save-invoice-google-drive"
+                onClick={handleSaveToGoogleDrive}
+                disabled={isSavingToDrive}
+                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-black uppercase text-xs flex items-center gap-1.5 border border-black cursor-pointer shadow-sm active:translate-y-0.5 disabled:opacity-50"
+                title="Save invoice copy to Google Drive"
+              >
+                <Cloud className="w-4 h-4 text-amber-300" />
+                <span>{isSavingToDrive ? 'Saving...' : 'Save to Drive'}</span>
+              </button>
+
               <button
                 type="button"
                 id="btn-print-download-pdf"
@@ -351,6 +468,26 @@ UPI: ${companyProfile.upiId}`;
             </div>
           </div>
         </div>
+
+        {/* Google Drive Save Status Toast */}
+        {driveSaveStatus && (
+          <div className={`text-xs font-mono py-1.5 px-4 text-center font-bold print:hidden flex items-center justify-center gap-2 border-b ${
+            driveSaveStatus.success ? 'bg-emerald-600 text-white border-emerald-700' : 'bg-red-600 text-white border-red-700'
+          }`}>
+            <span>{driveSaveStatus.success ? '✓ ' : '✕ '}{driveSaveStatus.msg}</span>
+            {driveSaveStatus.link && (
+              <a
+                href={driveSaveStatus.link}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline text-amber-200 hover:text-white flex items-center gap-1 ml-1"
+              >
+                <span>Open in Drive</span>
+                <ExternalLink className="w-3 h-3" />
+              </a>
+            )}
+          </div>
+        )}
 
         {/* Copy Notification Toast */}
         {copiedNotification && (
@@ -580,10 +717,10 @@ UPI: ${companyProfile.upiId}`;
                   {/* Right: UPI QR Representation & Signatory Box */}
                   <div className="p-3 flex flex-col justify-between bg-neutral-50/50">
                     <div className="flex items-center gap-3 pb-2 border-b border-neutral-200">
-                      {/* Styled Vector QR Code Box */}
-                      <div className="w-16 h-16 border-2 border-black bg-white p-1 flex flex-col items-center justify-center flex-shrink-0">
-                        <QrCode className="w-10 h-10 text-black" />
-                        <span className="text-[7px] font-black uppercase text-center leading-none mt-0.5">Scan UPI</span>
+                      {/* Styled Dynamic Vector QR Code Box */}
+                      <div className="border-2 border-black bg-white p-1 flex flex-col items-center justify-center flex-shrink-0">
+                        <QRCodeSVG value={upiPayload} size={60} level="M" />
+                        <span className="text-[7px] font-black uppercase text-center leading-none mt-1">₹{order.totalAmount.toFixed(0)} UPI</span>
                       </div>
                       <div className="text-[10px] space-y-0.5">
                         <span className="font-bold text-black uppercase block">Instant Digital Payment</span>
@@ -746,13 +883,19 @@ UPI: ${companyProfile.upiId}`;
                       </p>
                     </div>
 
-                    {/* Bank Info */}
-                    <div className="p-3 bg-neutral-50 border border-neutral-300 text-xs font-mono space-y-1">
-                      <span className="font-bold text-neutral-800 uppercase block text-[10px]">
-                        Direct Bank Transfer Details:
-                      </span>
-                      <p>Bank: {companyProfile.bankName} | A/C: <strong>{companyProfile.accountNumber}</strong></p>
-                      <p>IFSC: <strong>{companyProfile.ifscCode}</strong> | UPI: <strong>{companyProfile.upiId}</strong></p>
+                    {/* Bank Info & Dynamic UPI QR */}
+                    <div className="p-3 bg-neutral-50 border border-neutral-300 text-xs font-mono flex items-center justify-between gap-3">
+                      <div className="space-y-1 flex-1">
+                        <span className="font-bold text-neutral-800 uppercase block text-[10px]">
+                          Direct Bank Transfer & UPI Details:
+                        </span>
+                        <p>Bank: {companyProfile.bankName} | A/C: <strong>{companyProfile.accountNumber}</strong></p>
+                        <p>IFSC: <strong>{companyProfile.ifscCode}</strong> | UPI: <strong>{companyProfile.upiId}</strong></p>
+                      </div>
+                      <div className="p-1 bg-white border border-neutral-400 flex flex-col items-center flex-shrink-0">
+                        <QRCodeSVG value={upiPayload} size={56} level="M" />
+                        <span className="text-[6px] font-black uppercase text-center mt-0.5">Scan UPI</span>
+                      </div>
                     </div>
                   </div>
 
@@ -881,10 +1024,11 @@ UPI: ${companyProfile.upiId}`;
 
                 {/* QR Code & Footer */}
                 <div className="pt-2 space-y-1 text-center">
-                  <div className="inline-block p-1 bg-white border border-black">
-                    <QrCode className="w-12 h-12 mx-auto text-black" />
+                  <div className="inline-block p-1 bg-white border border-black shadow-xs">
+                    <QRCodeSVG value={upiPayload} size={76} level="M" />
                   </div>
                   <p className="text-[9px] font-bold">UPI: {companyProfile.upiId}</p>
+                  <p className="text-[9px] font-mono text-neutral-800 font-bold">Scan to Pay: ₹{order.totalAmount.toLocaleString('en-IN')}</p>
                   <p className="text-[9px] text-neutral-500 uppercase mt-2">
                     THANK YOU FOR SHOPPING!
                   </p>
